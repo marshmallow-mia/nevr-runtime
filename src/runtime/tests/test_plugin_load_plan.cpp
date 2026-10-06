@@ -177,6 +177,20 @@ plugins:
   EXPECT_EQ(DuplicatePluginEntry(plan, 1), -1);
 }
 
+TEST(PluginLoadPlan, ArgsEscapedDollarBraceReachesThePlugin) {
+  // $${ in an arg reaches the plugin as a literal ${, with no variable looked up.
+  const NevrConfig cfg = NevrConfig::LoadFromString(R"YAML(
+plugins:
+  - name: p
+    file: p.dll
+    args:
+      template: "Hello $${name}"
+)YAML");
+  const std::vector<PluginLoadItem> plan = BuildLoadPlan(cfg);
+  ASSERT_EQ(plan.size(), 1u);
+  EXPECT_EQ(plan[0].args_json, R"({"template":"Hello ${name}"})");
+}
+
 TEST(PluginLoadPlan, ArgsToJsonEmptyMapIsEmptyObject) {
   EXPECT_EQ(ArgsToJson({}), "{}");
 }
