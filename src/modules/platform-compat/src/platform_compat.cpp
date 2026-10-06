@@ -166,35 +166,31 @@ BOOL WINAPI CreateDirectoryAHook(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecu
 // WinHTTP CoCreateInstance hook
 // ---------------------------------------------------------------------------
 
-static const CLSID CLSID_WinHttpRequest = {
+// MSXML6's FreeThreadedXMLHTTP60 (not WinHTTP's WinHttpRequest, {2087C2F4-...}).
+static const CLSID CLSID_FreeThreadedXMLHTTP60 = {
     0x88d96a09, 0xf192, 0x11d4, {0xa6, 0x5f, 0x00, 0x40, 0x96, 0x32, 0x51, 0xe5}};
 
 typedef HRESULT(WINAPI* CoCreateInstanceFunc)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
 static CoCreateInstanceFunc OriginalCoCreateInstance = nullptr;
 
+/* #133: this class is the system's own object again. The game drives it as
+ * IXMLHTTPRequest3 (IXMLHTTPRequest2 + SetClientCertificate); the libcurl stub
+ * (runtime/compat/winhttp_stub.cpp) has IWinHttpRequest's IDispatch layout, so the
+ * game's Open landed in GetTypeInfoCount and its Send in GetTypeInfo, which wrote
+ * through an argument the game never passed: a windowed client crashed right after
+ * start. Nothing the client needs goes through this request (login and social
+ * traffic use ws_bridge), and the real object serves it -- under Wine it answers
+ * E_NOTIMPL, which the game logs once and carries on. The hook stays installed so
+ * the module's outcome reporting (winhttp=ok, the N120 server gate) is unchanged. */
 HRESULT WINAPI CoCreateInstanceHook(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext,
                                     REFIID riid, LPVOID* ppv) {
-  if (IsEqualCLSID(rclsid, CLSID_WinHttpRequest)) {
-    Log(EchoVR::LogLevel::Debug, "[NEVR.PATCH] WinHTTP COM → libcurl bridge");
-
-    static bool s_protectionFixed = false;
-    if (!s_protectionFixed) {
-      DWORD oldProtect;
-      PVOID rdataStart = (PVOID)(EchoVR::g_GameBaseAddress + 0x16E8000);
-      if (VirtualProtect(rdataStart, 0x2000, PAGE_READWRITE, &oldProtect)) {
-        Log(EchoVR::LogLevel::Debug, "[NEVR.PATCH] Made COM rdata page writable (was 0x%lX)", oldProtect);
-      }
-      s_protectionFixed = true;
+  if (IsEqualCLSID(rclsid, CLSID_FreeThreadedXMLHTTP60)) {
+    static bool s_said = false;
+    if (!s_said) {
+      s_said = true;
+      Log(EchoVR::LogLevel::Debug, "[NEVR.PATCH] FreeThreadedXMLHTTP60: the system's object (#133)");
     }
-
-    extern HRESULT CreateWinHttpRequestStub(REFIID riid, void** ppvObject);
-    HRESULT hr = CreateWinHttpRequestStub(riid, ppv);
-    if (FAILED(hr)) {
-      Log(EchoVR::LogLevel::Warning, "[NEVR.PATCH] WinHTTP stub creation failed: 0x%08lX", hr);
-    }
-    return hr;
   }
-
   return OriginalCoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
 }
 
