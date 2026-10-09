@@ -374,6 +374,13 @@ static VOID InitializeAfterGameImageGuard() {
   BuiltinLogFilter::Init(reinterpret_cast<uintptr_t>(EchoVR::g_GameBaseAddress), false);
   BootLogTee::TeeFprintf("[NEVR.PATCH] log filter installed\n");
 
+  // DLL load callbacks held during boot: a DLL already loaded when its callback registered (an
+  // injector such as Revive's loads dxgi/d3d12 before nEVR starts). They log, and before the log
+  // filter Log() went through the game's CLog, not set up yet, and crashed inside echovr.exe.
+  BootLogTee::TeeFprintf("[NEVR.BOOT] firing held DLL load callbacks...\n");
+  DllLoadHook::FireHeldCallbacks();
+  BootLogTee::TeeFprintf("[NEVR.PATCH] held DLL load callbacks fired\n");
+
   // --- Game function hooks ---
   BootLogTee::TeeFprintf("[NEVR.BOOT] installing game function hooks...\n");
   BOOL r1 = Hooking::Attach(reinterpret_cast<PVOID*>(&EchoVR::BuildCmdLineSyntaxDefinitions),

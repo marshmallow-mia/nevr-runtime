@@ -23,6 +23,14 @@ void Shutdown();
  * The callback fires once per load. Multiple callbacks per DLL are supported. */
 void OnLoad(const char* dll_name, PatchCallback callback);
 
+/* While nEVR boots, a callback for a DLL that is already loaded when it registers is held
+ * instead of fired: an injector such as Revive's loads dxgi/d3d12 before nEVR starts, and the
+ * callbacks log, which before the log filter goes through the game's CLog, not set up yet this
+ * early (an access violation inside echovr.exe). Install() starts holding them;
+ * FireHeldCallbacks(), once the log filter is in, fires what was held and stops holding. */
+void HoldEarlyCallbacks();
+void FireHeldCallbacks();
+
 /* Trigger callbacks for a DLL that was loaded through a non-LoadLibrary path
  * (e.g., the game's CSysDLL_Load). Only fires each callback once per DLL. */
 void FireCallbacksForModule(const char* lower_name, HMODULE module);
