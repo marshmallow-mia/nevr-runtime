@@ -44,6 +44,7 @@ std::vector<PluginLoadItem> BuildLoadPlan(const nevr::NevrConfig& cfg) {
     item.required = spec.required;
     item.target = spec.target;
     item.args_json = ArgsToJson(spec.args);
+    item.early = spec.early;
     plan.push_back(std::move(item));
   }
   return plan;

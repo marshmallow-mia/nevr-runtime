@@ -20,8 +20,9 @@
 // `target` is a deployment-target hint (carried, unused by the loader in S6);
 // `args_json` is the entry's args as a flat JSON object string ("{}" when none);
 // `enabled` false means the loader skips it. Disabled entries are carried (not
-// dropped) so the login can report them (#60). `enabled` is last so existing
-// five-value brace initializers keep meaning what they meant.
+// dropped) so the login can report them (#60). `early` true loads it in the early
+// pass (see PluginInPhase). `enabled` and `early` come last so existing five-value
+// brace initializers keep meaning what they meant.
 struct PluginLoadItem {
   std::string name;
   std::string file;
@@ -29,7 +30,23 @@ struct PluginLoadItem {
   std::string target;
   std::string args_json;
   bool        enabled = true;
+  bool        early = false;
 };
+
+// The two load passes. Early runs at the game's first PreprocessCommandLine,
+// before the original call: before the game reads its data (manifests, packages),
+// so a plugin that serves game data from elsewhere is in place in time. The rest
+// load in the normal pass, after the graphics device (client) or the first
+// PreprocessCommandLine (server), with the runtime's own setup done.
+enum class PluginPhase : std::uint8_t { Early = 0, Normal = 1 };
+
+// Whether `phase` loads `item`: the early pass takes the entries marked early, the
+// normal pass the rest -- and the early ones as well when no early pass ran, so a
+// boot path that never reaches it still loads every plugin.
+inline bool PluginInPhase(const PluginLoadItem& item, PluginPhase phase, bool earlyPassRan) {
+  if (phase == PluginPhase::Early) return item.early;
+  return !item.early || !earlyPassRan;
+}
 
 // The ordered plugin load plan from config.yaml's `plugins:` list: every entry,
 // disabled ones included with enabled=false. Reads the same config.yaml singleton

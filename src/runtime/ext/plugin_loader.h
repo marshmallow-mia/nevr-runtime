@@ -3,10 +3,13 @@
 #include <string>
 
 #include "extension/plugin_interface.h"
+#include "runtime/ext/plugin_load_plan.h"  // PluginPhase
 
-// Discover and load all plugins from the plugins/ subdirectory.
-// Must be called after Hooking::Initialize() and after g_isServer/g_isHeadless are known.
-void LoadPlugins();
+// Load the plugins config.yaml lists for `phase` from the plugins/ subdirectory
+// (see PluginPhase: the entries marked `early: true` in the early pass, the rest
+// in the normal one). Must be called after Hooking::Initialize() and after
+// g_isServer/g_isHeadless are known.
+void LoadPlugins(PluginPhase phase = PluginPhase::Normal);
 
 // Explicit normal-thread teardown helper: calls each optional shutdown export
 // in reverse load order, then releases the host's module reference. DllMain

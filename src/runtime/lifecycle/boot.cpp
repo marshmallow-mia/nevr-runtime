@@ -145,6 +145,14 @@ UINT64 PreprocessCommandLineHook(PVOID pGame) {
   // bootstraps immediately after its first original call returns.
   g_pGame = pGame;
   PreflightRuntimeBootstrap();
+  // Plugins marked `early: true` load here, before the original call: the game reads
+  // its manifests during it, before the graphics device exists (where the rest load),
+  // so a plugin that serves game data from elsewhere has to be in place now.
+  static bool s_earlyPlugins = false;
+  if (!s_earlyPlugins) {
+    s_earlyPlugins = true;
+    LoadPlugins(PluginPhase::Early);
+  }
   UINT64 result = EchoVR::PreprocessCommandLine(pGame);
   if (g_isServer) {
     RunDeferredRuntimeBootstrap(pGame, "Preprocess first-call server bootstrap");

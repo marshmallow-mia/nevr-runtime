@@ -94,7 +94,14 @@ static void FailPluginLoad(const PluginLoadItem& item, const std::string& reason
   }
 }
 
-void LoadPlugins() {
+// #60: the report covers every configured entry across both load passes (see
+// PluginPhase); each pass fills in its own entries and publishes the whole list.
+static std::vector<PluginManifestEntry> g_bootReport;
+static bool g_earlyPassRan = false;
+
+void LoadPlugins(PluginPhase phase) {
+  const bool early = phase == PluginPhase::Early;
+
   // Resolve plugins/ directory relative to echovr.exe (same dir as pnsradgameserver.dll)
   CHAR moduleDir[MAX_PATH] = {0};
   GetModuleFileNameA(reinterpret_cast<HMODULE>(EchoVR::g_GameBaseAddress), moduleDir, MAX_PATH);
@@ -111,6 +118,7 @@ void LoadPlugins() {
   // taking over for an entire run because it happened to sit in the directory.
   const std::vector<PluginLoadItem> plan = NevrCfgPluginLoadPlan();
   if (plan.empty()) {
+    if (early) return;
     PublishPluginReport({});
     Log(EchoVR::LogLevel::Info,
         "[NEVR.PLUGIN] no plugins configured in config.yaml — loading none");
@@ -118,20 +126,38 @@ void LoadPlugins() {
   }
 
   // #60: one report entry per configured plugin, in config order. Each starts
-  // "not loaded, no error" and is filled in as the loader decides its fate.
-  std::vector<PluginManifestEntry> report(plan.size());
-  size_t enabledCount = 0;
-  for (size_t i = 0; i < plan.size(); ++i) {
-    report[i].name = plan[i].name;
-    report[i].file = plan[i].file;
-    report[i].enabled = plan[i].enabled;
-    report[i].required = plan[i].required;
-    if (plan[i].enabled) ++enabledCount;
+  // "not loaded, no error" and is filled in as the loader decides its fate; the
+  // first pass makes the list, the next one keeps what the first filled in.
+  if (g_bootReport.size() != plan.size()) {
+    g_bootReport.assign(plan.size(), PluginManifestEntry{});
+    for (size_t i = 0; i < plan.size(); ++i) {
+      g_bootReport[i].name = plan[i].name;
+      g_bootReport[i].file = plan[i].file;
+      g_bootReport[i].enabled = plan[i].enabled;
+      g_bootReport[i].required = plan[i].required;
+    }
   }
+  std::vector<PluginManifestEntry>& report = g_bootReport;
+  size_t enabledCount = 0;
+  size_t phaseCount = 0;
+  for (const PluginLoadItem& item : plan) {
+    if (!item.enabled) continue;
+    ++enabledCount;
+    if (PluginInPhase(item, phase, g_earlyPassRan)) ++phaseCount;
+  }
+  if (early && phaseCount == 0) return;  // the usual case: nothing is marked early
 
-  Log(EchoVR::LogLevel::Info,
-      "[NEVR.PLUGIN] %zu plugin(s) configured, %zu enabled; loading in list order from %s",
-      plan.size(), enabledCount, pluginDir.c_str());
+  if (early) {
+    Log(EchoVR::LogLevel::Info,
+        "[NEVR.PLUGIN] early pass: %zu plugin(s) marked early; loading them before the game "
+        "reads its data, from %s",
+        phaseCount, pluginDir.c_str());
+  } else {
+    Log(EchoVR::LogLevel::Info,
+        "[NEVR.PLUGIN] %zu plugin(s) configured, %zu enabled; loading in list order from %s",
+        plan.size(), enabledCount, pluginDir.c_str());
+  }
+  const size_t loadedBefore = g_plugins.size();
 
   // Build init context (shared; the per-plugin channel is args_json via InitEx).
   NvrGameContext ctx = {};
@@ -175,6 +201,7 @@ void LoadPlugins() {
 
   for (size_t planIndex = 0; planIndex < plan.size(); ++planIndex) {
     const PluginLoadItem& item = plan[planIndex];
+    if (!PluginInPhase(item, phase, g_earlyPassRan)) continue;  // the other pass's
     PluginManifestEntry& itemReport = report[planIndex];
     const std::string path = pluginDir + item.file;
     const char* filename = item.file.c_str();
@@ -256,19 +283,25 @@ void LoadPlugins() {
       continue;
     }
     // The backstop for what the file-name check can't see: another spelling of the
-    // same path. LoadLibrary counted a reference for this call; give it back.
+    // same path, in this pass or loaded by the early one. LoadLibrary counted a
+    // reference for this call; give it back.
     {
-      const StagedPlugin* already = nullptr;
+      std::string already;
       for (const StagedPlugin& s : staged) {
-        if (s.hModule == hPlugin) { already = &s; break; }
+        if (s.hModule == hPlugin) { already = s.item.name + " (" + s.item.file + ")"; break; }
       }
-      if (already) {
+      for (const LoadedPlugin& p : g_plugins) {
+        if (already.empty() && p.hModule == hPlugin) {
+          already = std::string(p.info.name ? p.info.name : "?") + " (early)";
+        }
+      }
+      if (!already.empty()) {
         FreeLibrary(hPlugin);
         Log(EchoVR::LogLevel::Warning,
-            "[NEVR.PLUGIN] SKIPPED %s (%s) — the same module as %s (%s), already loaded. "
+            "[NEVR.PLUGIN] SKIPPED %s (%s) — the same module as %s, already loaded. "
             "Remove one of the entries from config.yaml.",
-            item.name.c_str(), filename, already->item.name.c_str(), already->item.file.c_str());
-        itemReport.error = "the same module as " + already->item.name;
+            item.name.c_str(), filename, already.c_str());
+        itemReport.error = "the same module as " + already;
         continue;
       }
     }
@@ -367,8 +400,12 @@ void LoadPlugins() {
   }
 
   // A plugin may keep what get_plugin_info returned from inside its init: no
-  // push_back below may move the ones already loaded.
-  g_plugins.reserve(g_plugins.size() + staged.size());
+  // push_back below, in this pass or the next, may move the ones already loaded.
+  // Room for every configured entry, reserved by the first pass, covers both: an
+  // entry loads at most once, so the second never outgrows it.
+  const size_t room = plan.size() > g_plugins.size() + staged.size() ? plan.size()
+                                                                     : g_plugins.size() + staged.size();
+  if (g_plugins.capacity() < room) g_plugins.reserve(room);
   for (const StagedPlugin& s : staged) {
     const char* initVia = s.initKind == PluginInitKind::Ex ? "InitEx" :
                           s.initKind == PluginInitKind::Legacy ? "Init" : "no-init";
@@ -434,10 +471,16 @@ void LoadPlugins() {
   // (healthy) from "5 enabled, 3 loaded" (2 silently missing) without
   // scrolling back through Warning lines to count. Disabled entries are not
   // missing, so they are not in the denominator.
-  Log(EchoVR::LogLevel::Info, "[NEVR.PLUGIN] plugin load complete: %zu/%zu loaded",
-      g_plugins.size(), enabledCount);
+  if (early) {
+    g_earlyPassRan = true;
+    Log(EchoVR::LogLevel::Info, "[NEVR.PLUGIN] early pass complete: %zu/%zu loaded",
+        g_plugins.size() - loadedBefore, phaseCount);
+  } else {
+    Log(EchoVR::LogLevel::Info, "[NEVR.PLUGIN] plugin load complete: %zu/%zu loaded",
+        g_plugins.size(), enabledCount);
+  }
 
-  PublishPluginReport(std::move(report));
+  PublishPluginReport(report);  // a copy: the normal pass still fills in its entries
 }
 
 void UnloadPlugins() {
@@ -448,6 +491,7 @@ void UnloadPlugins() {
     FreeLibrary(it->hModule);
   }
   g_plugins.clear();
+  g_bootReport.clear();
   PublishPluginReport({});  // nothing is loaded any more; do not report stale state
 }
 

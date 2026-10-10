@@ -322,11 +322,17 @@ arena:
 #   args      — plugin-specific arguments, passed as config JSON to InitEx
 #   target    — (optional) "server" | "client" | "both" (default: both);
 #               the loader skips server-only plugins on clients and vice-versa
+#   early     — if true, the plugin loads at the game's first command-line pass,
+#               before the game reads its data (manifests, packages); the rest
+#               load after the graphics device (client) / that pass (server).
+#               For a plugin that must be in place before then, e.g. one that
+#               serves game data from elsewhere. Default false.
 #
 # All keys except "name" are optional. Absent enabled defaults to true.
 # Absent required defaults to false.
 # Absent args means the plugin gets an empty JSON object.
 # Absent target means the plugin loads on both servers and clients.
+# Absent early means the plugin loads in the normal pass.
 #
 # Reported at login (#60): the client login JSON carries a top-level
 # "nevr_plugins" array with one object per entry of this list, in list order:
