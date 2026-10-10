@@ -32,9 +32,10 @@ function(set_project_version_from_git)
     return()
   endif()
 
-  # Get PROJECT_VERSION from git describe
+  # Get PROJECT_VERSION from git describe: release tags (vX.Y.Z) only, not pre-release ones
+  # (v4.0.1-beta.1), which the parse below has no place for
   execute_process(
-    COMMAND ${GIT_EXECUTABLE} describe --tags --abbrev=4 --long --match "v*"
+    COMMAND ${GIT_EXECUTABLE} describe --tags --abbrev=4 --long --match "v*" --exclude "v*-*"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     OUTPUT_VARIABLE GIT_PROJECT_VERSION_STRING
     ERROR_VARIABLE GIT_PROJECT_VERSION_ERROR
