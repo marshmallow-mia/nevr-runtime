@@ -248,6 +248,11 @@ inline CredentialCacheLocation SelectCredentialCacheLocation(const std::string& 
     return {directory, JoinCredentialPath(directory, ".credentials.json")};
 }
 
+// The cache inside `directory` (a server's: beside the config.yaml it runs with).
+inline CredentialCacheLocation CredentialCacheIn(const std::string& directory) {
+    return {directory, JoinCredentialPath(directory, ".credentials.json")};
+}
+
 // Reads a selected .credentials.json. Missing, unreadable, or malformed files
 // return an empty token; no farther cache is consulted after selection.
 inline CachedAuthToken LoadCachedAuthTokenFromPath(const std::string& path) {
@@ -288,15 +293,11 @@ inline CachedAuthToken LoadCachedAuthToken(const std::string& exeDir) {
 // Does NOT validate expiry — caller decides whether to use token or refresh.
 inline CachedAuthToken LoadCachedAuthToken() { return LoadCachedAuthToken(GetExeDirectory()); }
 
-// Saves the REFRESH TOKEN (and identity) to _local/.credentials.json.
+// Saves the REFRESH TOKEN (and identity) to `location`, creating its folder.
 // The access token is deliberately NOT persisted — it lives in memory only.
-// Searches for existing _local/ directory with parent-directory fallback
-// (same paths as LoadCachedAuthToken). Creates _local/ next to the executable
-// if none found.
-inline bool SaveAuthToken(const CachedAuthToken& auth, const std::string& exeDir) {
+inline bool SaveAuthTokenAt(const CachedAuthToken& auth, const CredentialCacheLocation& location) {
     if (auth.refresh_token.empty()) return false;
 
-    const CredentialCacheLocation location = SelectCredentialCacheLocation(exeDir);
     const std::string& target_dir = location.directory;
     if (!CredentialPathExists(target_dir)) {
 #ifdef _WIN32
@@ -391,6 +392,13 @@ inline bool SaveAuthToken(const CachedAuthToken& auth, const std::string& exeDir
 #endif
 
     return true;
+}
+
+// Saves to the cache LoadCachedAuthToken reads: an existing _local/.credentials.json
+// (with the parent-directory fallback), else beside the first config.yaml, else
+// _local/ next to the executable.
+inline bool SaveAuthToken(const CachedAuthToken& auth, const std::string& exeDir) {
+    return SaveAuthTokenAt(auth, SelectCredentialCacheLocation(exeDir));
 }
 
 inline bool SaveAuthToken(const CachedAuthToken& auth) { return SaveAuthToken(auth, GetExeDirectory()); }

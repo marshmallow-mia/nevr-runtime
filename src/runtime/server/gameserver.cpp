@@ -1410,7 +1410,10 @@ static std::string AuthenticateServer() {
 }
 
 // Mints a ServerDB access token: refresh-token exchange first, password auth as
-// the fallback. Returns "" when neither produced one. Called from
+// the fallback. Returns "" when neither produced one. A server signs in as its own
+// account: it reads (and refreshes) only the cached sign-in beside the config.yaml it
+// runs with, never one a client keeps elsewhere in the game's _local folders (a
+// launcher's, or the in-game device sign-in's, for the player on the same install). Called from
 // RequestRegistration (game thread) and, since #39, from the WebSocketClient's
 // token refresher on ixwebsocket's thread after ServerDB answers 401. Config
 // reads go through NevrCfgGetFlat's mutex-guarded intern pool. RefreshAuthToken
@@ -1420,7 +1423,10 @@ static std::string AuthenticateServer() {
 // could overlap the two.
 static std::string AcquireServerDbToken() {
     std::string token;
-    auto auth = LoadCachedAuthToken();
+    const char* configDir = NevrCfgDirectory();
+    const CredentialCacheLocation cache =
+        configDir ? CredentialCacheIn(configDir) : SelectCredentialCacheLocation(GetExeDirectory());
+    auto auth = LoadCachedAuthTokenFromPath(cache.credentialsPath);
     if (auth.HasValidToken()) {
         token = auth.token;
         Log(EchoVR::LogLevel::Debug, "[NEVR.GAMESERVER] Using cached auth token for ServerDB");
@@ -1442,7 +1448,7 @@ static std::string AcquireServerDbToken() {
         const char* httpUri = NevrCfgGetFlat("nevr_http_uri");
         const char* httpKey = NevrCfgGetFlat("nevr_http_key");
         if (httpUri && httpKey && httpUri[0] != '\0' && httpKey[0] != '\0' &&
-            RefreshAuthToken(auth, httpUri, httpKey)) {
+            RefreshAuthToken(auth, httpUri, httpKey, &cache)) {
             token = auth.token;
             Log(EchoVR::LogLevel::Info,
                 "[NEVR.GAMESERVER] ServerDB auth via refreshed OAuth2 token (device-flow credential)");

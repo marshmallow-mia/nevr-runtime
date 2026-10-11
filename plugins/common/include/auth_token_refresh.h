@@ -14,10 +14,12 @@
 // Refresh an expired access token using the refresh token.
 // Calls the custom device/auth/refresh RPC (not the standard Nakama session
 // refresh, which uses a different signing key and requires session cache).
-// On success, updates auth in-place and saves to disk. Returns true on success.
+// On success, updates auth in-place and saves it to disk: to `cache` when given,
+// else to the executable-relative cache SaveAuthToken picks. Returns true on success.
 inline bool RefreshAuthToken(CachedAuthToken& auth,
                              const std::string& nakama_url,
-                             const std::string& http_key) {
+                             const std::string& http_key,
+                             const CredentialCacheLocation* cache = nullptr) {
     if (auth.refresh_token.empty()) return false;
 
     CURL* curl = curl_easy_init();
@@ -120,7 +122,11 @@ inline bool RefreshAuthToken(CachedAuthToken& auth,
                 ResolveRefreshTokenExpirySec(now, ReadExpiresInSeconds(j, "refresh_token_expires_in"));
         }
 
-        SaveAuthToken(auth);
+        if (cache) {
+            SaveAuthTokenAt(auth, *cache);
+        } else {
+            SaveAuthToken(auth);
+        }
         // No success log here — token_auth.cpp:476 (the only real caller) already
         // logs the success at Info with more detail (expires_in) immediately
         // after this returns true; a line here would just duplicate it.

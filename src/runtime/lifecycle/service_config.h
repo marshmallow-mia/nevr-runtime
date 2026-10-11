@@ -44,6 +44,11 @@ const char* NevrCfgAutoRelay(unsigned bridgePort);
 /// engine's own default. Does not touch config.yaml.
 const char* NevrGameNativeDefault(const char* key);
 
+/// The folder of the config.yaml in use (the -config/-config-path folder when it holds
+/// one, else the `_local` folder it was found in), without a trailing separator; null
+/// when there is none. Stable for the process lifetime.
+const char* NevrCfgDirectory();
+
 /// True unless config.yaml explicitly sets `social.facade: false`.
 bool NevrCfgSocialFacadeEnabled();
 

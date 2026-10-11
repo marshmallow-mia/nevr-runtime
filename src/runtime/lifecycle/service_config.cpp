@@ -286,3 +286,12 @@ const char* NevrCfgGameNativeConfigJson() {
 std::vector<PluginLoadItem> NevrCfgPluginLoadPlan() {
   return nevr_plugincfg::BuildLoadPlan(NevrCfg());
 }
+
+const char* NevrCfgDirectory() {
+  static const std::string dir = []() {
+    const std::string path = FindNevrConfigYamlPath();
+    const std::size_t slash = path.find_last_of("\\/");
+    return slash == std::string::npos ? std::string() : path.substr(0, slash);
+  }();
+  return dir.empty() ? nullptr : dir.c_str();
+}
