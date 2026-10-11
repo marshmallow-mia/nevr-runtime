@@ -15,6 +15,7 @@
 
 #include "runtime/lifecycle/service_config.h"
 #include "runtime/lifecycle/service_map.h"
+#include "runtime/compat/bridge_role.h"   // the bridge URL's role path (#513)
 #include "runtime/lifecycle/cli.h"        // g_customConfigPath, g_isServer (drags core/pch.h -> windows.h, now NOMINMAX)
 #include "runtime/lifecycle/crash_recovery.h"  // ServerFatal (S4a fail-loud)
 #include "runtime/ext/plugin_load_plan.h"        // PluginLoadItem / NevrCfgPluginLoadPlan (N134 S6)
@@ -239,14 +240,15 @@ const char* NevrCfgServiceHost(const char* flatServiceKey, int* outSource) {
 }
 
 const char* NevrCfgRedirect(const char* result, const char* httpTargetJson, int bridgeActive,
-                            unsigned bridgePort) {
+                            unsigned bridgePort, const char* keyName) {
   if (result == nullptr) return nullptr;
   const std::optional<std::string> socketTarget = Flat("nevr_socket_uri");
   std::optional<std::string> httpTarget;
   if (httpTargetJson != nullptr && httpTargetJson[0] != '\0') httpTarget = std::string(httpTargetJson);
 
   const std::optional<std::string> redir =
-      nevr_cfg::ResolveRedirect(result, socketTarget, httpTarget, bridgeActive != 0, bridgePort);
+      nevr_cfg::ResolveRedirect(result, socketTarget, httpTarget, bridgeActive != 0, bridgePort,
+                                nevr_bridge_role::PathForServiceKey(keyName));
   if (!redir) return nullptr;
   return InternCStr(*redir);
 }
@@ -258,10 +260,11 @@ const char* NevrGameNativeDefault(const char* key) {
   return InternCStr(*v);
 }
 
-const char* NevrCfgAutoRelay(unsigned bridgePort) {
+const char* NevrCfgAutoRelay(unsigned bridgePort, const char* keyName) {
   const std::optional<std::string> socketTarget = Flat("nevr_socket_uri");
   if (!socketTarget || socketTarget->empty()) return nullptr;
-  return InternCStr(std::string("ws://127.0.0.1:") + std::to_string(bridgePort));
+  return InternCStr(std::string("ws://127.0.0.1:") + std::to_string(bridgePort) +
+                    nevr_bridge_role::PathForServiceKey(keyName));
 }
 
 bool NevrCfgSocialFacadeEnabled() {

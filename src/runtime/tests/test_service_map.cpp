@@ -268,6 +268,23 @@ TEST(ServiceMap, ResolveRedirect_WsBridgeActiveRewritesToLoopback) {
   }
 }
 
+TEST(ServiceMap, ResolveRedirect_TheBridgePathFollowsThePort) {
+  // #513: the config and login services reach the bridge on their own path; without the bridge the
+  // socket target is used as it is.
+  const std::optional<std::string> target("ws://g.echovrce.com:80/spr");
+  const auto viaBridge = ResolveRedirect("wss://login.readyatdawn.com/rad/rad15_live", target, std::nullopt,
+                                         /*bridgeActive=*/true, /*bridgePort=*/53748, "/login");
+  ASSERT_TRUE(viaBridge.has_value());
+  EXPECT_EQ(*viaBridge, "ws://127.0.0.1:53748/login");
+  const auto again = ResolveRedirect("ws://127.0.0.1:53748/config", target, std::nullopt, true, 53748, "/config");
+  ASSERT_TRUE(again.has_value());
+  EXPECT_EQ(*again, "ws://127.0.0.1:53748/config");
+  const auto direct = ResolveRedirect("wss://login.readyatdawn.com/rad/rad15_live", target, std::nullopt,
+                                      /*bridgeActive=*/false, 0, "/login");
+  ASSERT_TRUE(direct.has_value());
+  EXPECT_EQ(*direct, "ws://g.echovrce.com:80/spr");
+}
+
 TEST(ServiceMap, ResolveRedirect_HttpsReadyAtDawnUsesHttpTargetNotBridge) {
   // https readyatdawn.com redirects to the http target and NEVER hits the bridge,
   // even when the bridge is active.

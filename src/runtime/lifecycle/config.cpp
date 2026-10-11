@@ -457,8 +457,9 @@ UINT64 HttpConnectHook(PVOID unk, CHAR* uri) {
 //   https:// URLs → nevr_http_uri (HTTP API endpoint)
 static std::atomic<bool> s_serviceRedirectsArmed{false};
 
-static const char* ResolveLoginOverrideBridgeUrl(void*, uint16_t bridgePort) {
-  return NevrCfgAutoRelay(bridgePort);
+// `context` is the game's key, which names the bridge URL's role path (#513).
+static const char* ResolveLoginOverrideBridgeUrl(void* context, uint16_t bridgePort) {
+  return NevrCfgAutoRelay(bridgePort, static_cast<const char*>(context));
 }
 
 VOID ArmServiceRedirects() { s_serviceRedirectsArmed.store(true, std::memory_order_release); }
@@ -483,10 +484,11 @@ static CHAR* RedirectServiceUrl(CHAR* keyName, CHAR* result) {
   // the engine's value passes through, so a run with neither file redirects
   // nothing. NevrCfgRedirect runs the scheme detection + bridge rewrite
   // (ws/wss any-host or https readyatdawn.com only; bridge-active ws ->
-  // ws://127.0.0.1:<port>; https never hits the bridge).
+  // ws://127.0.0.1:<port>, with /config or /login for those services so the
+  // bridge knows the socket's role, #513; https never hits the bridge).
   const char* httpTarget = NevrCfgGetFlat("nevr_http_uri");
   const char* redirected =
-      NevrCfgRedirect(result, httpTarget, IsWebSocketBridgeActive() ? 1 : 0, GetWebSocketBridgePort());
+      NevrCfgRedirect(result, httpTarget, IsWebSocketBridgeActive() ? 1 : 0, GetWebSocketBridgePort(), keyName);
   if (redirected == NULL) return result;
 
   const std::string diagnostic = LogDiagnostics::FormatRedactedUrlPairDiagnostic(
@@ -525,7 +527,7 @@ CHAR* JsonValueAsStringHook(EchoVR::Json* root, CHAR* keyName, CHAR* defaultValu
   }
 
   const nevr::lifecycle::LoginRedirectOverrideOutcome overrideOutcome =
-      nevr::lifecycle::ApplyLoginRedirectOverride(overrideInput, ResolveLoginOverrideBridgeUrl, nullptr);
+      nevr::lifecycle::ApplyLoginRedirectOverride(overrideInput, ResolveLoginOverrideBridgeUrl, keyName);
   if (overrideOutcome.action == nevr::lifecycle::LoginRedirectOverrideAction::UseOverride) {
     if (overrideInput.redirectsArmed) {
       const std::string diagnostic = LogDiagnostics::FormatRedactedUrlPairDiagnostic(
