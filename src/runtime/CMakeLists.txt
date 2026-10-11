@@ -87,6 +87,8 @@ set(PATCHES_HEADERS
     "patch/resource_override.h"
     "patch/splash_texture.h"
     "lifecycle/state_machine.h"
+    "lifecycle/server_bringup.h"
+    "lifecycle/server_timestep.h"
     "ext/plugin_loader.h"
     "ext/plugin_load_plan.h"
     "ext/plugin_load_plan_build.h"
@@ -512,8 +514,10 @@ if(BUILD_TESTING)
       GTest::gtest GTest::gtest_main nevr_core minhook zstd::libzstd nlohmann_json::nlohmann_json)
     gtest_discover_tests(test_social_facade DISCOVERY_MODE PRE_TEST)
 
-    add_executable(test_early_quit_lockout tests/test_early_quit_lockout.cpp)
-    set_source_files_properties(tests/test_early_quit_lockout.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+    # test_server_timestep.cpp (#511, header-only lifecycle/server_timestep.h) rides in this executable.
+    add_executable(test_early_quit_lockout tests/test_early_quit_lockout.cpp tests/test_server_timestep.cpp)
+    set_source_files_properties(tests/test_early_quit_lockout.cpp tests/test_server_timestep.cpp
+                                PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
     target_include_directories(test_early_quit_lockout PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(test_early_quit_lockout PRIVATE GTest::gtest GTest::gtest_main)
     gtest_discover_tests(test_early_quit_lockout DISCOVERY_MODE PRE_TEST)
@@ -525,7 +529,8 @@ if(BUILD_TESTING)
       GTest::gtest GTest::gtest_main nevr_core nlohmann_json::nlohmann_json)
     gtest_discover_tests(test_scenario_early_quit DISCOVERY_MODE PRE_TEST)
 
-    add_executable(test_schannel_cred_guard tests/test_schannel_cred_guard.cpp)
+    # test_server_bringup.cpp (#45, header-only lifecycle/server_bringup.h) rides in this executable.
+    add_executable(test_schannel_cred_guard tests/test_schannel_cred_guard.cpp tests/test_server_bringup.cpp)
     target_include_directories(test_schannel_cred_guard PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(test_schannel_cred_guard PRIVATE GTest::gtest GTest::gtest_main)
     gtest_discover_tests(test_schannel_cred_guard DISCOVERY_MODE PRE_TEST)
