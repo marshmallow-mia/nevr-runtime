@@ -364,6 +364,61 @@ static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR lpFileName, HANDLE hFile, DWO
     return result;
 }
 
+/* InstallImportHook's slot and the value it held before (#1843). The value is kept after Shutdown() puts it back:
+ * a call that read the slot before then still calls through it. */
+static void** g_importSlotLoadLibraryW = nullptr;
+static decltype(&LoadLibraryW) g_importPrevLoadLibraryW = nullptr;
+
+/* The import slot's detour: the load goes where the slot pointed (kernel32's entry, with whatever hooks are on it),
+ * then the observers run, before the call returns to the module that made it. */
+static HMODULE WINAPI ImportedLoadLibraryW(LPCWSTR lpFileName) {
+    HMODULE result = g_importPrevLoadLibraryW(lpFileName);
+    RunPostLoadObservers();
+    return result;
+}
+
+/* The slot through which `module` calls `function` of `dll` (the DLL name compared without case), or nullptr when
+ * the module imports no such function by name. */
+static void** FindImportSlot(HMODULE module, const char* dll, const char* function) {
+    auto* base = reinterpret_cast<std::uint8_t*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (imports.VirtualAddress == 0) return nullptr;
+    for (auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + imports.VirtualAddress); desc->Name != 0;
+         ++desc) {
+        if (_stricmp(reinterpret_cast<const char*>(base + desc->Name), dll) != 0) continue;
+        const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+        for (; names->u1.AddressOfData != 0; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            const auto* byName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(byName->Name), function) == 0) {
+                return reinterpret_cast<void**>(&slots->u1.Function);
+            }
+        }
+    }
+    return nullptr;
+}
+
+/* Swaps `slot` from `expected` to `value` in one store; false when it held something else or cannot be made
+ * writable. An import table is read-only once the loader has bound it. */
+static bool SwapImportSlot(void** slot, void* expected, void* value) {
+    DWORD old = 0;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old)) return false;
+    const bool swapped = InterlockedCompareExchangePointer(slot, value, expected) == expected;
+    VirtualProtect(slot, sizeof(*slot), old, &old);
+    return swapped;
+}
+
+#ifdef NEVR_DLL_LOAD_HOOK_TESTING
+void** FindImportSlotForTest(HMODULE module, const char* dll, const char* function) {
+    return FindImportSlot(module, dll, function);
+}
+
+void** ImportSlotForTest() { return g_importSlotLoadLibraryW; }
+#endif
+
 #endif // _WIN32
 
 void AddLoadFilter(const char* name, LoadFilter filter) {
@@ -454,6 +509,35 @@ void AddPostLoadObserver(PostLoadObserver observer) {
     g_observers.push_back(observer);
 }
 
+bool InstallImportHook(HMODULE module) {
+#ifdef _WIN32
+    void** slot = FindImportSlot(module, "kernel32.dll", "LoadLibraryW");
+    if (slot == nullptr) {
+        nevr_boot_log_tee::TeeFprintf(
+            "[NEVR.DLLHOOK] warn; import hook FAILED name=LoadLibraryW reason=not_imported — a load through the "
+            "module's import runs the post-load observers only while the LoadLibrary hooks are in kernel32's chain\n");
+        return false;
+    }
+    void* previous = *slot;
+    if (previous == reinterpret_cast<void*>(&ImportedLoadLibraryW)) return true;
+    g_importPrevLoadLibraryW = reinterpret_cast<decltype(&LoadLibraryW)>(previous);
+    if (!SwapImportSlot(slot, previous, reinterpret_cast<void*>(&ImportedLoadLibraryW))) {
+        nevr_boot_log_tee::TeeFprintf(
+            "[NEVR.DLLHOOK] warn; import hook FAILED name=LoadLibraryW reason=slot_not_written — a load through the "
+            "module's import runs the post-load observers only while the LoadLibrary hooks are in kernel32's chain\n");
+        return false;
+    }
+    g_importSlotLoadLibraryW = slot;
+    nevr_boot_log_tee::TeeFprintf("[NEVR.DLLHOOK] info; import hook OK name=LoadLibraryW slot_rva=0x%llx\n",
+                                  static_cast<unsigned long long>(reinterpret_cast<std::uint8_t*>(slot) -
+                                                                  reinterpret_cast<std::uint8_t*>(module)));
+    return true;
+#else
+    (void)module;
+    return false;
+#endif
+}
+
 int Install() {
 #ifdef _WIN32
     // N129. These four hooks run the load filters (AddLoadFilter), post-load
@@ -526,6 +610,11 @@ int Install() {
 
 void Shutdown() {
 #ifdef _WIN32
+    if (g_importSlotLoadLibraryW) {
+        SwapImportSlot(g_importSlotLoadLibraryW, reinterpret_cast<void*>(&ImportedLoadLibraryW),
+                       reinterpret_cast<void*>(g_importPrevLoadLibraryW));
+        g_importSlotLoadLibraryW = nullptr;
+    }
     if (g_origLoadLibraryA)   MH_DisableHook((void*)&LoadLibraryA);
     if (g_origLoadLibraryW)   MH_DisableHook((void*)&LoadLibraryW);
     if (g_origLoadLibraryExA) MH_DisableHook((void*)&LoadLibraryExA);

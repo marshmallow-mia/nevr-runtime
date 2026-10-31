@@ -1,0 +1,1 @@
+Echo VR started through Revive no longer fails matchmaking with "Matchmaker is unavailable".

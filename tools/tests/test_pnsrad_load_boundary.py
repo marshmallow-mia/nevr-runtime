@@ -76,6 +76,14 @@ class PnsradLoadBoundary(unittest.TestCase):
         self.assertRegex(runner.lstrip("{ \n"), r"^if \(LoaderLockHeldByThisThread\(\)\) return;",
                          "observers must not run while the calling thread holds the loader lock")
 
+    def test_the_games_load_library_import_runs_the_observers(self):
+        # #1843: an injector that detaches and re-attaches its detours on kernel32's LoadLibraryW takes the hooks
+        # above out of the chain; the game's own import slot still reaches the observers.
+        init = strip_comments((ROOT / "src/runtime/lifecycle/initialize.cpp").read_text())
+        self.assertIn(
+            "nevr_dll_load_hook::InstallImportHook(reinterpret_cast<HMODULE>(EchoVR::g_GameBaseAddress));", init,
+            "the boot no longer points the game's LoadLibraryW import at the observers")
+
     def test_the_tick_applies_loads_that_missed_their_library_return(self):
         body = extract_braced_function(strip_comments(TICK.read_text()), "void DispatchPerFrameWork(uint64_t nowUs)")
         self.assertIn("nevr_pnsrad_enabler::ApplyLoadsMissedAtLibraryReturn()", body)

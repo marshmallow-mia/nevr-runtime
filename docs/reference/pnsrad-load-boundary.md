@@ -28,6 +28,7 @@ return of `KERNEL32!LoadLibraryW` at `0x1400eb13d`. The module's own `DllMain` r
 | --- | --- |
 | Record | `OnDllLoaded` in `src/runtime/patch/pnsrad_enabler.cpp`, the `LdrRegisterDllNotification` callback: classifies the module by `BaseDllName` (`nevr_pnsrad_load::Classify`) and records its kind and base in `nevr_pnsrad_load::PendingLoads` (`src/runtime/patch/pnsrad_load_queue.h`). Atomic stores only; no write, no log, no call out of the module |
 | Apply at the boundary | `nevr_dll_load_hook` runs its post-load observers after the real `LoadLibraryA/W/ExA/ExW` returns, on the calling thread, before the hook returns to the game (`src/runtime/hook/dll_load_hook.cpp`). `nevr_pnsrad_enabler::Init` registers `ApplyPendingLoadsAtLibraryReturn`, which drains the records and applies the patches (`ApplyPnsradLoad`, `ApplyMatchmakingLoad`) under one mutex, so a `LoadLibrary` returning on another thread waits for a patch in progress |
+| The game's import slot | the observers run from two places: the inline hooks on kernel32's entry points (`nevr_dll_load_hook::Install`), and the game's own import slot for `KERNEL32.dll!LoadLibraryW`, `[0x1416c3210]`, the slot the load at `0x1400eb13d` calls through (`nevr_dll_load_hook::InstallImportHook`, called right after `Install` in `src/runtime/lifecycle/initialize.cpp`). The slot's detour calls what the slot held, so the inline hook and any other module's hook on kernel32 still run, then runs the observers. An injector that detours kernel32's entry with Detours, then detaches and attaches again (Revive's `ovr_Initialize`), writes kernel32's bytes back over the inline hook and takes it out of the chain; the slot is a pointer in `echovr.exe` that no inline hook changes (#1843) |
 | Loader lock held | the observers are skipped when the calling thread owns the loader lock (a `LoadLibrary` from inside a `DllMain`, `LoaderLockHeldByThisThread`); the next return outside the lock applies the record |
 | Fallback | the frame tick (`nevr_pnsrad_enabler::ApplyLoadsMissedAtLibraryReturn`) applies a record at least one tick old, with a Warning that the load did not pass through a hooked `LoadLibrary*` and the game may have used the module unpatched |
 
@@ -39,10 +40,16 @@ What a client run's log shows on success: `[NEVR.PATCH] pnsrad module patches: 4
 - `src/runtime/tests/test_dll_load_hook.cpp`, `DllLoadHookPostLoad`: a real `LoadLibraryW` of a stand-in `pnsrad.dll`
   under the real hooks and a real DLL notification; the caller's first read of the module after `LoadLibraryW`
   returns must see the patched value. A second test holds the loader lock and checks the observers wait.
+- `src/runtime/tests/test_dll_load_hook.cpp`, `DllLoadHookPostLoad.APatchLandsBeforeTheFirstReadWhenAnotherModuleRestoredKernel32`: kernel32's
+  bytes written back over the inline hook, as Detours' detach does, then a load through the test binary's import slot;
+  the caller's first read must see the patched value. `DllLoadHookImport`: the slot is found by name past an import
+  by ordinal, the detour calls what the slot held before the observers run, a second install changes nothing, and
+  `Shutdown` puts the slot back.
 - `src/runtime/tests/test_pnsrad_load_queue.cpp`: the record and drain contract (once per record, reloads as
   separate records, a full queue counted, the tick's one-tick delay, concurrent producers and drains).
 - `tools/tests/test_pnsrad_load_boundary.py`: the notification calls nothing but the record; every `LoadLibrary*` hook
-  runs the observers after the real call; `Init` registers the observer; the tick drains what was missed.
+  runs the observers after the real call; the boot hooks the game's import slot; `Init` registers the observer; the
+  tick drains what was missed.
 
 ## Not proven
 

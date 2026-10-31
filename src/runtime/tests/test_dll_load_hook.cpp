@@ -129,6 +129,7 @@ class DllLoadHookIsolation : public testing::Test {
       ASSERT_EQ(nevr_dll_load_hook::OriginalForTest(variant), nullptr) << variant << ": a trampoline outlived the previous test";
     }
     ASSERT_EQ(nevr_hook_guard::RecordedCount(), 0) << "a hook-guard record outlived the previous test";
+    ASSERT_EQ(nevr_dll_load_hook::ImportSlotForTest(), nullptr) << "an import hook outlived the previous test";
   }
 
   void TearDown() override {
@@ -146,6 +147,7 @@ class DllLoadHookCallbacks : public DllLoadHookIsolation {};
 class DllLoadHookInstall : public DllLoadHookIsolation {};
 class DllLoadHookOnLoad : public DllLoadHookIsolation {};
 class DllLoadHookPostLoad : public DllLoadHookIsolation {};
+class DllLoadHookImport : public DllLoadHookIsolation {};
 
 TEST_F(DllLoadHookFilter, RefusesAFilteredLoadThroughEveryVariantAndLeavesOthersAlone) {
   ASSERT_EQ(MH_Initialize(), MH_OK);
@@ -611,6 +613,240 @@ TEST_F(DllLoadHookPostLoad, ObserversWaitUntilTheCallingThreadReleasesTheLoaderL
   EXPECT_FALSE(nevr_dll_load_hook::LoaderLockHeldByThisThread());
   ASSERT_NE(LoadLibraryW(L"ws2_32.dll"), nullptr);
   EXPECT_EQ(g_observerRuns.load(), 2);
+}
+
+// #1843: Revive's ovr_Initialize detaches its Detours hooks from kernel32's LoadLibraryW and attaches them again,
+// which writes kernel32's own bytes back over Install()'s hook. The game's module loader calls LoadLibraryW through
+// its import slot, so InstallImportHook points that slot at a detour that runs the observers. Here this test binary's
+// own slot stands in for echovr.exe's, and the bytes written back stand in for DetourDetach.
+TEST_F(DllLoadHookPostLoad, APatchLandsBeforeTheFirstReadWhenAnotherModuleRestoredKernel32) {
+  g_fixturePatches = 0;
+  auto* entry = reinterpret_cast<std::uint8_t*>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW"));
+  ASSERT_NE(entry, nullptr);
+  std::uint8_t unhooked[16];
+  std::memcpy(unhooked, entry, sizeof(unhooked));
+  ASSERT_EQ(MH_Initialize(), MH_OK);
+  nevr_dll_load_hook::Install();
+  ASSERT_TRUE(nevr_hook_guard::IsOurDetour(entry));
+  nevr_dll_load_hook::AddPostLoadObserver(&PatchFixtureLoads);
+
+  HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+  auto reg = reinterpret_cast<RegisterNotificationFn>(GetProcAddress(ntdll, "LdrRegisterDllNotification"));
+  auto unreg = reinterpret_cast<UnregisterNotificationFn>(GetProcAddress(ntdll, "LdrUnregisterDllNotification"));
+  ASSERT_NE(reg, nullptr);
+  ASSERT_NE(unreg, nullptr);
+  void* cookie = nullptr;
+  ASSERT_EQ(reg(0, RecordFixtureLoad, nullptr, &cookie), 0);
+  struct NotificationGuard {
+    UnregisterNotificationFn unregister;
+    void* cookie;
+    void Release() {
+      if (cookie != nullptr) unregister(cookie);
+      cookie = nullptr;
+    }
+    ~NotificationGuard() { Release(); }
+  } notification{unreg, cookie};
+
+  // What DetourDetach does: the bytes the entry had before Install() go back, and its hook is no longer called.
+  DWORD protect = 0;
+  ASSERT_TRUE(VirtualProtect(entry, sizeof(unhooked), PAGE_EXECUTE_READWRITE, &protect));
+  std::memcpy(entry, unhooked, sizeof(unhooked));
+  VirtualProtect(entry, sizeof(unhooked), protect, &protect);
+  FlushInstructionCache(GetCurrentProcess(), entry, sizeof(unhooked));
+  ASSERT_FALSE(nevr_hook_guard::IsOurDetour(entry)) << "precondition: Install()'s hook is out of kernel32's chain";
+
+  HMODULE self = GetModuleHandleW(nullptr);
+  ASSERT_TRUE(nevr_dll_load_hook::InstallImportHook(self));
+  void** slot = nevr_dll_load_hook::FindImportSlotForTest(self, "kernel32.dll", "LoadLibraryW");
+  ASSERT_NE(slot, nullptr);
+  const std::wstring path = FixturePnsradPath();
+  ASSERT_EQ(GetModuleHandleW(path.c_str()), nullptr) << "precondition: the fixture is not loaded yet";
+  // The game's `call [slot]`, then its first use of the module.
+  const auto load = reinterpret_cast<decltype(&LoadLibraryW)>(*static_cast<void* volatile*>(slot));
+  HMODULE module = load(path.c_str());
+  const auto* data = module ? reinterpret_cast<const int*>(GetProcAddress(module, "FixtureData")) : nullptr;
+  const int firstRead = data ? *data : -1;
+
+  notification.Release();
+  nevr_dll_load_hook::Shutdown();  // puts this binary's slot back before anything else calls LoadLibraryW
+  ASSERT_NE(module, nullptr) << "fixture missing: export-trace-fixture\\pnsrad.dll next to the test";
+  EXPECT_EQ(g_fixturePatches.load(), 1) << "no observer patched the recorded load";
+  EXPECT_EQ(firstRead, 4321) << "the caller read the module before its patch landed";
+  FreeLibrary(module);
+}
+
+namespace {
+
+// A module image in memory with one import descriptor, for "KERNEL32.dll": an import by ordinal, then LoadLibraryW
+// by name. Its import slots are on a read-only page, as the loader leaves a bound import table. With `unwritable`,
+// the image is a read-only view of a section, so the slots page cannot be made writable either.
+struct SyntheticImage {
+  static constexpr DWORD kSize = 0x2000;
+  static constexpr DWORD kDescriptors = 0x200;
+  static constexpr DWORD kDllName = 0x280;
+  static constexpr DWORD kNames = 0x300;
+  static constexpr DWORD kHintName = 0x400;
+  static constexpr DWORD kSlots = 0x1000;
+
+  HANDLE section = nullptr;
+  std::uint8_t* writer = nullptr;
+  std::uint8_t* base = nullptr;
+
+  SyntheticImage(void* loadLibraryW, bool withImports, bool unwritable = false) {
+    section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kSize, nullptr);
+    writer = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, kSize));
+    base = unwritable ? static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_READ, 0, 0, kSize)) : writer;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(writer);
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_maxalloc = 0xFFFF;  // as linkers write it: read as an import descriptor, its Name is 0xFFFF
+    dos->e_lfanew = 0x40;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(writer + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    if (withImports) {
+      nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = kDescriptors;
+      nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+      auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(writer + kDescriptors);
+      desc->OriginalFirstThunk = kNames;
+      desc->Name = kDllName;
+      desc->FirstThunk = kSlots;
+      std::strcpy(reinterpret_cast<char*>(writer + kDllName), "KERNEL32.dll");
+      auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(writer + kNames);
+      names[0].u1.Ordinal = IMAGE_ORDINAL_FLAG | 5;
+      names[1].u1.AddressOfData = kHintName;
+      std::strcpy(reinterpret_cast<char*>(writer + kHintName + sizeof(WORD)), "LoadLibraryW");
+      auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(writer + kSlots);
+      slots[0].u1.Function = 0x1234;  // the ordinal import's slot, never called
+      slots[1].u1.Function = reinterpret_cast<ULONG_PTR>(loadLibraryW);
+    }
+    DWORD old = 0;
+    VirtualProtect(base + kSlots, kSize - kSlots, PAGE_READONLY, &old);
+  }
+  ~SyntheticImage() {
+    if (base != writer) UnmapViewOfFile(base);
+    UnmapViewOfFile(writer);
+    CloseHandle(section);
+  }
+  SyntheticImage(const SyntheticImage&) = delete;
+  SyntheticImage& operator=(const SyntheticImage&) = delete;
+
+  HMODULE Module() const { return reinterpret_cast<HMODULE>(base); }
+  void** Slot() const { return reinterpret_cast<void**>(base + kSlots + sizeof(IMAGE_THUNK_DATA)); }
+  void* SlotValue() const { return *static_cast<void* volatile*>(Slot()); }
+  DWORD SlotProtection() const {
+    MEMORY_BASIC_INFORMATION info{};
+    VirtualQuery(Slot(), &info, sizeof(info));
+    return info.Protect;
+  }
+  // The importing module's `call [slot]`.
+  HMODULE CallThroughSlot(const wchar_t* name) const {
+    return reinterpret_cast<decltype(&LoadLibraryW)>(SlotValue())(name);
+  }
+};
+
+std::atomic<int> g_fakeLoads{0};
+std::atomic<int> g_loadsSeenByObserver{-1};
+HMODULE WINAPI FakeLoadLibraryW(LPCWSTR) {
+  ++g_fakeLoads;
+  return reinterpret_cast<HMODULE>(0x5678);
+}
+void RecordLoadsSeen() {
+  ++g_observerRuns;
+  g_loadsSeenByObserver = g_fakeLoads.load();
+}
+void ResetImportCounters() {
+  g_fakeLoads = 0;
+  g_observerRuns = 0;
+  g_loadsSeenByObserver = -1;
+}
+void* FakeLoad() { return reinterpret_cast<void*>(&FakeLoadLibraryW); }
+
+}  // namespace
+
+TEST_F(DllLoadHookImport, FindsTheSlotByNamePastAnImportByOrdinal) {
+  SyntheticImage image(FakeLoad(), true);
+  EXPECT_EQ(nevr_dll_load_hook::FindImportSlotForTest(image.Module(), "kernel32.dll", "LoadLibraryW"), image.Slot())
+      << "the DLL name is compared without case";
+  EXPECT_EQ(nevr_dll_load_hook::FindImportSlotForTest(image.Module(), "ntdll.dll", "LoadLibraryW"), nullptr);
+  EXPECT_EQ(nevr_dll_load_hook::FindImportSlotForTest(image.Module(), "kernel32.dll", "LoadLibraryA"), nullptr);
+}
+
+TEST_F(DllLoadHookImport, AModuleWithoutImportsHasNoSlot) {
+  SyntheticImage image(FakeLoad(), false);
+  EXPECT_EQ(nevr_dll_load_hook::FindImportSlotForTest(image.Module(), "kernel32.dll", "LoadLibraryW"), nullptr);
+}
+
+TEST_F(DllLoadHookImport, TheSlotCallsWhatItHeldThenRunsTheObservers) {
+  ResetImportCounters();
+  SyntheticImage image(FakeLoad(), true);
+  nevr_dll_load_hook::AddPostLoadObserver(&RecordLoadsSeen);
+  ASSERT_TRUE(nevr_dll_load_hook::InstallImportHook(image.Module()));
+  EXPECT_EQ(nevr_dll_load_hook::ImportSlotForTest(), image.Slot());
+  EXPECT_NE(image.SlotValue(), FakeLoad());
+  EXPECT_EQ(image.SlotProtection(), static_cast<DWORD>(PAGE_READONLY)) << "the slot's page is read-only again";
+
+  EXPECT_EQ(image.CallThroughSlot(L"pnsrad.dll"), reinterpret_cast<HMODULE>(0x5678));
+  EXPECT_EQ(g_fakeLoads.load(), 1);
+  EXPECT_EQ(g_observerRuns.load(), 1);
+  EXPECT_EQ(g_loadsSeenByObserver.load(), 1) << "the observers ran before the load";
+  nevr_dll_load_hook::Shutdown();
+}
+
+TEST_F(DllLoadHookImport, ASecondInstallLeavesTheSlotAsItIs) {
+  ResetImportCounters();
+  SyntheticImage image(FakeLoad(), true);
+  nevr_dll_load_hook::AddPostLoadObserver(&RecordLoadsSeen);
+  ASSERT_TRUE(nevr_dll_load_hook::InstallImportHook(image.Module()));
+  void* const hooked = image.SlotValue();
+  ASSERT_TRUE(nevr_dll_load_hook::InstallImportHook(image.Module()));
+  EXPECT_EQ(image.SlotValue(), hooked);
+  // A detour that had saved itself as the slot's old value would call itself and never return.
+  EXPECT_EQ(image.CallThroughSlot(L"pnsrad.dll"), reinterpret_cast<HMODULE>(0x5678));
+  EXPECT_EQ(g_fakeLoads.load(), 1);
+  EXPECT_EQ(g_observerRuns.load(), 1);
+  nevr_dll_load_hook::Shutdown();
+}
+
+TEST_F(DllLoadHookImport, ShutdownPutsTheSlotBack) {
+  SyntheticImage image(FakeLoad(), true);
+  ASSERT_TRUE(nevr_dll_load_hook::InstallImportHook(image.Module()));
+  nevr_dll_load_hook::Shutdown();
+  EXPECT_EQ(image.SlotValue(), FakeLoad());
+  EXPECT_EQ(nevr_dll_load_hook::ImportSlotForTest(), nullptr);
+}
+
+TEST_F(DllLoadHookImport, AnInstalledImportHookSaysOkWithTheSlotInTheBootFile) {
+  SyntheticImage image(FakeLoad(), true);
+  bool installed = false;
+  const std::string boot =
+      BootFileTextWrittenBy([&] { installed = nevr_dll_load_hook::InstallImportHook(image.Module()); });
+  nevr_dll_load_hook::Shutdown();
+  EXPECT_TRUE(installed);
+  EXPECT_NE(boot.find("[NEVR.DLLHOOK] info; import hook OK name=LoadLibraryW slot_rva=0x1008"), std::string::npos)
+      << "boot file was:\n" << boot;
+}
+
+TEST_F(DllLoadHookImport, AModuleThatDoesNotImportLoadLibraryWIsReported) {
+  SyntheticImage image(FakeLoad(), false);
+  bool installed = true;
+  const std::string boot =
+      BootFileTextWrittenBy([&] { installed = nevr_dll_load_hook::InstallImportHook(image.Module()); });
+  EXPECT_FALSE(installed);
+  EXPECT_NE(boot.find("[NEVR.DLLHOOK] warn; import hook FAILED name=LoadLibraryW reason=not_imported"),
+            std::string::npos)
+      << "boot file was:\n" << boot;
+}
+
+TEST_F(DllLoadHookImport, ASlotThatCannotBeWrittenIsReportedAndLeftAlone) {
+  SyntheticImage image(FakeLoad(), true, true);
+  bool installed = true;
+  const std::string boot =
+      BootFileTextWrittenBy([&] { installed = nevr_dll_load_hook::InstallImportHook(image.Module()); });
+  EXPECT_FALSE(installed);
+  EXPECT_EQ(image.SlotValue(), FakeLoad());
+  EXPECT_EQ(nevr_dll_load_hook::ImportSlotForTest(), nullptr);
+  EXPECT_NE(boot.find("[NEVR.DLLHOOK] warn; import hook FAILED name=LoadLibraryW reason=slot_not_written"),
+            std::string::npos)
+      << "boot file was:\n" << boot;
 }
 
 // #632: the per-variant failure line, with its MH_STATUS, and the PARTIAL summary reach the boot file.

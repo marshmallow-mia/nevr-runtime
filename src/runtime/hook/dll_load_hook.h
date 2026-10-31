@@ -86,6 +86,16 @@ void OnLoad(const char* dll_name, PatchCallback callback);
 typedef void (*PostLoadObserver)();
 void AddPostLoadObserver(PostLoadObserver observer);
 
+/* Points `module`'s import slot for KERNEL32.dll!LoadLibraryW at a detour that calls what the slot held, then runs
+ * the post-load observers (#1843). The game's module loader loads pnsrad.dll and pnsradmatchmaking.dll through that
+ * slot (docs/reference/pnsrad-load-boundary.md). An injector that detours kernel32's entry with Detours, then detaches
+ * and attaches again (Revive's ovr_Initialize), writes kernel32's own bytes back over Install()'s hook, and from then
+ * on a load through kernel32 never reaches it; the slot is a pointer in `module` that no inline hook on kernel32
+ * changes. The detour still calls kernel32's entry, so Install()'s hook and an injector's run as before. Reports
+ * through the boot tee. Returns whether the slot holds the detour: false when `module` imports no LoadLibraryW by
+ * name or the slot cannot be written; a second call changes nothing. Shutdown() puts the old value back. */
+bool InstallImportHook(HMODULE module);
+
 /* True when the calling thread owns the process's loader lock (PEB LoaderLock). */
 bool LoaderLockHeldByThisThread();
 
@@ -109,6 +119,12 @@ void SetMinHookOpsForTest(const MinHookOps* ops);
 /* The trampoline Install() holds for "LoadLibraryA"/"LoadLibraryW"/"LoadLibraryExA"/"LoadLibraryExW",
  * or nullptr when it holds none. */
 void* OriginalForTest(const char* name);
+
+/* The slot through which `module` calls `function` of `dll`, as InstallImportHook() finds it, or nullptr. */
+void** FindImportSlotForTest(HMODULE module, const char* dll, const char* function);
+
+/* The slot InstallImportHook() points at its detour and Shutdown() has not yet put back, or nullptr. */
+void** ImportSlotForTest();
 
 /* Sets the four trampoline pointers OriginalForTest() reads to nullptr. Shutdown() only disables the
  * hooks; after MH_Uninitialize() the pointers would otherwise still name freed trampolines. */

@@ -432,6 +432,10 @@ static VOID InitializeAfterGameImageGuard() {
     g_bootHookFailed = true;
     NoteBootHookFailureCause(dllLoadHooksVerdict.cause);
   }
+  // The game's own LoadLibraryW import runs the post-load observers too, so the pnsrad patches land at the game's
+  // LoadLibraryW return even when an injector's detours take the hooks above out of kernel32's chain (#1843). Not
+  // required: without it the frame tick still applies a missed load.
+  nevr_dll_load_hook::InstallImportHook(reinterpret_cast<HMODULE>(EchoVR::g_GameBaseAddress));
 
   // --- Headless graphics stubs (DXGI/D3D11 interception) ---
   // Register callbacks now so they fire when the game loads dxgi.dll/d3d11.dll.
