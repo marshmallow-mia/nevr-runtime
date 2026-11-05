@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "core/logging.h"
 #include "nevr/pc/nevr_common.h"
@@ -206,6 +207,214 @@ void QueryNvidia(nevr_gpu_score::NvidiaMeasure* out) {
 
 using NvidiaQueryFn = void (*)(nevr_gpu_score::NvidiaMeasure* out);
 
+// ---- AMD. The game's AGS teraFlops is 0 under Proton; the same figure is made from Vulkan's compute-unit count and the
+// Linux host's top engine clock (patch/gpu_score.h, AmdScore). A Windows run with a working AMD driver keeps the game's
+// own score and never gets here. ----
+
+// The Linux host's DRM class directory, through the Z: drive Wine maps to the host's root. It exists only under Wine.
+constexpr const char* kHostDrmRoot = "Z:\\sys\\class\\drm";
+
+// The Vulkan structures the AMD query reads, as the Vulkan 1.1 headers lay them out (the tree has no Vulkan headers).
+constexpr std::int32_t kVkStructureTypeApplicationInfo = 0;
+constexpr std::int32_t kVkStructureTypeInstanceCreateInfo = 1;
+constexpr std::int32_t kVkStructureTypePhysicalDeviceProperties2 = 1000059001;
+constexpr std::int32_t kVkStructureTypeShaderCorePropertiesAmd = 1000185000;
+constexpr std::int32_t kVkStructureTypeShaderCoreProperties2Amd = 1000227000;
+constexpr std::uint32_t kVkApiVersion11 = (1U << 22) | (1U << 12);
+constexpr std::uint32_t kVkMaxPhysicalDevices = 16;
+
+struct VkApplicationInfoLite {
+  std::int32_t sType;
+  const void* pNext;
+  const char* pApplicationName;
+  std::uint32_t applicationVersion;
+  const char* pEngineName;
+  std::uint32_t engineVersion;
+  std::uint32_t apiVersion;
+};
+struct VkInstanceCreateInfoLite {
+  std::int32_t sType;
+  const void* pNext;
+  std::uint32_t flags;
+  const VkApplicationInfoLite* pApplicationInfo;
+  std::uint32_t enabledLayerCount;
+  const char* const* ppEnabledLayerNames;
+  std::uint32_t enabledExtensionCount;
+  const char* const* ppEnabledExtensionNames;
+};
+// VkPhysicalDeviceProperties2: VkPhysicalDeviceProperties is 824 bytes (vendorID at +8, deviceID at +12).
+struct VkPhysicalDeviceProperties2Lite {
+  std::int32_t sType;
+  void* pNext;
+  std::uint32_t apiVersion;
+  std::uint32_t driverVersion;
+  std::uint32_t vendorID;
+  std::uint32_t deviceID;
+  unsigned char rest[824 - 16];
+};
+static_assert(sizeof(VkPhysicalDeviceProperties2Lite) == 840, "VkPhysicalDeviceProperties2 is 840 bytes on x64");
+// VkPhysicalDeviceShaderCorePropertiesAMD: 14 uint32 after the header; the first three are the CU layout.
+struct VkShaderCorePropertiesAmdLite {
+  std::int32_t sType;
+  void* pNext;
+  std::uint32_t shaderEngineCount;
+  std::uint32_t shaderArraysPerEngineCount;
+  std::uint32_t computeUnitsPerShaderArray;
+  std::uint32_t rest[11];
+};
+struct VkShaderCoreProperties2AmdLite {
+  std::int32_t sType;
+  void* pNext;
+  std::uint32_t shaderCoreFeatures;
+  std::uint32_t activeComputeUnitCount;
+};
+struct VkExtensionPropertiesLite {
+  char extensionName[256];
+  std::uint32_t specVersion;
+};
+
+using VkGetInstanceProcAddrFn = void* (*)(void* instance, const char* name);
+using VkCreateInstanceFn = std::int32_t (*)(const VkInstanceCreateInfoLite* info, const void* allocator, void** instance);
+using VkDestroyInstanceFn = void (*)(void* instance, const void* allocator);
+using VkEnumeratePhysicalDevicesFn = std::int32_t (*)(void* instance, std::uint32_t* count, void** devices);
+using VkGetPhysicalDeviceProperties2Fn = void (*)(void* device, VkPhysicalDeviceProperties2Lite* properties);
+using VkEnumerateDeviceExtensionPropertiesFn = std::int32_t (*)(void* device, const char* layer, std::uint32_t* count,
+                                                                VkExtensionPropertiesLite* properties);
+
+// The PCI vendor and device id of the DXGI adapter whose description is the game's GPU name: the adapter the game matched
+// its AGS device by (0x14058eb90..0x14058ebb2).
+bool AdapterIdsByName(const std::string& gpuName, std::uint32_t* vendorId, std::uint32_t* deviceId) {
+  HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+  if (dxgi == nullptr) return false;
+  using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+  const auto create =
+      reinterpret_cast<CreateFactoryFn>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+  if (create == nullptr) return false;
+  IDXGIFactory1* factory = nullptr;
+  if (FAILED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || factory == nullptr) return false;
+  bool found = false;
+  for (UINT index = 0; !found; ++index) {
+    IDXGIAdapter* adapter = nullptr;
+    if (factory->EnumAdapters(index, &adapter) != S_OK || adapter == nullptr) break;
+    DXGI_ADAPTER_DESC desc = {};
+    if (SUCCEEDED(adapter->GetDesc(&desc))) {
+      char narrow[256] = {};
+      WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+      if (nevr_render_config::CleanText(narrow) == gpuName) {
+        *vendorId = desc.VendorId;
+        *deviceId = desc.DeviceId;
+        found = true;
+      }
+    }
+    adapter->Release();
+  }
+  factory->Release();
+  return found;
+}
+
+// The compute units of the Vulkan device with this PCI vendor and device id; the step that failed in `out->failure`.
+void QueryVulkanComputeUnits(std::uint32_t vendorId, std::uint32_t deviceId, nevr_gpu_score::AmdMeasure* out) {
+  HMODULE vulkan = LoadLibraryW(L"vulkan-1.dll");
+  if (vulkan == nullptr) {
+    out->failure = "vulkan_absent";
+    return;
+  }
+  const auto getProc = reinterpret_cast<VkGetInstanceProcAddrFn>(
+      reinterpret_cast<void*>(GetProcAddress(vulkan, "vkGetInstanceProcAddr")));
+  const auto createInstance =
+      getProc != nullptr ? reinterpret_cast<VkCreateInstanceFn>(getProc(nullptr, "vkCreateInstance")) : nullptr;
+  void* instance = nullptr;
+  if (createInstance == nullptr) {
+    out->failure = "vulkan_no_create_instance";
+  } else {
+    const VkApplicationInfoLite app = {kVkStructureTypeApplicationInfo, nullptr, "nevr-runtime", 1, "nevr-runtime", 1,
+                                       kVkApiVersion11};
+    const VkInstanceCreateInfoLite info = {kVkStructureTypeInstanceCreateInfo, nullptr, 0, &app, 0, nullptr, 0, nullptr};
+    if (createInstance(&info, nullptr, &instance) != 0 || instance == nullptr) {
+      instance = nullptr;
+      out->failure = "vulkan_create_instance_failed";
+    }
+  }
+  if (instance != nullptr) {
+    const auto destroy = reinterpret_cast<VkDestroyInstanceFn>(getProc(instance, "vkDestroyInstance"));
+    const auto enumerate = reinterpret_cast<VkEnumeratePhysicalDevicesFn>(getProc(instance, "vkEnumeratePhysicalDevices"));
+    const auto properties2 =
+        reinterpret_cast<VkGetPhysicalDeviceProperties2Fn>(getProc(instance, "vkGetPhysicalDeviceProperties2"));
+    const auto extensions = reinterpret_cast<VkEnumerateDeviceExtensionPropertiesFn>(
+        getProc(instance, "vkEnumerateDeviceExtensionProperties"));
+    void* devices[kVkMaxPhysicalDevices] = {};
+    std::uint32_t count = kVkMaxPhysicalDevices;
+    if (enumerate == nullptr || properties2 == nullptr || extensions == nullptr) {
+      out->failure = "vulkan_function_missing";
+    } else if (enumerate(instance, &count, devices) < 0) {
+      out->failure = "vulkan_enumerate_failed";
+    } else {
+      out->failure = "vulkan_no_matching_device";
+      for (std::uint32_t i = 0; i < count && i < kVkMaxPhysicalDevices; ++i) {
+        VkPhysicalDeviceProperties2Lite props = {};
+        props.sType = kVkStructureTypePhysicalDeviceProperties2;
+        properties2(devices[i], &props);
+        if (props.vendorID != vendorId || props.deviceID != deviceId) continue;
+        // Only extensions the device has go into the chain.
+        std::uint32_t extensionCount = 0;
+        extensions(devices[i], nullptr, &extensionCount, nullptr);
+        std::vector<VkExtensionPropertiesLite> list(extensionCount);
+        if (extensionCount != 0) extensions(devices[i], nullptr, &extensionCount, list.data());
+        const auto has = [&list](const char* name) {
+          for (const VkExtensionPropertiesLite& extension : list) {
+            if (std::strcmp(extension.extensionName, name) == 0) return true;
+          }
+          return false;
+        };
+        VkShaderCorePropertiesAmdLite core = {};
+        core.sType = kVkStructureTypeShaderCorePropertiesAmd;
+        VkShaderCoreProperties2AmdLite core2 = {};
+        core2.sType = kVkStructureTypeShaderCoreProperties2Amd;
+        void* chain = nullptr;
+        if (has("VK_AMD_shader_core_properties")) {
+          core.pNext = chain;
+          chain = &core;
+        }
+        if (has("VK_AMD_shader_core_properties2")) {
+          core2.pNext = chain;
+          chain = &core2;
+        }
+        props.pNext = chain;
+        properties2(devices[i], &props);
+        const std::uint32_t units =
+            nevr_gpu_score::AmdComputeUnits(core2.activeComputeUnitCount, core.shaderEngineCount,
+                                            core.shaderArraysPerEngineCount, core.computeUnitsPerShaderArray);
+        if (units == 0) {
+          out->failure = "vulkan_no_shader_core_properties";
+        } else {
+          out->haveComputeUnits = true;
+          out->computeUnits = units;
+          out->failure = "";
+        }
+        break;
+      }
+    }
+    if (destroy != nullptr) destroy(instance, nullptr);
+  }
+  FreeLibrary(vulkan);
+}
+
+// Asks for the compute units and the top engine clock of the GPU named `gpuName`. Each value that answers sets its `have`
+// flag; the first step that does not answer names itself in `failure`.
+void QueryAmd(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out) {
+  std::uint32_t vendorId = 0;
+  std::uint32_t deviceId = 0;
+  if (!AdapterIdsByName(gpuName, &vendorId, &deviceId)) {
+    out->failure = "dxgi_adapter_not_found";
+    return;
+  }
+  QueryVulkanComputeUnits(vendorId, deviceId, out);
+  if (!out->haveComputeUnits) return;
+  nevr_gpu_score::ReadHostSclk(kHostDrmRoot, deviceId, out);
+}
+
+using AmdQueryFn = void (*)(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out);
+
 // ---- State. Written by Install and the hooks, read by Poll. ----
 
 ApplyFn g_originalApply = nullptr;
@@ -224,6 +433,7 @@ std::atomic<bool> g_checkFailureLogged{false};
 std::atomic<bool> g_traceLogged{false};
 std::atomic<bool> g_scoreLogged{false};
 NvidiaQueryFn g_nvidiaQuery = &QueryNvidia;
+AmdQueryFn g_amdQuery = &QueryAmd;
 
 // noinline: __builtin_return_address(0) must name this function's caller, the game's call site.
 __attribute__((noinline)) std::uint64_t ApplyHook(void* settings, void* game, int logFlag) {
@@ -247,8 +457,19 @@ bool WriteGameScore(std::uintptr_t address, double value) {
          written == sizeof(value);
 }
 
+// The game's GPU name (kGpuNameVa), cleaned as the render_config line cleans it; "" when it cannot be read.
+std::string ReadGameGpuName(const MemoryReader& reader, std::uintptr_t base) {
+  char name[nevr_render_config::kGpuNameBytes + 1] = {};
+  if (!reader.Read(nevr_render_config::Resolve(base, nevr_render_config::kGpuNameVa), name,
+                   nevr_render_config::kGpuNameBytes)) {
+    return "";
+  }
+  return nevr_render_config::CleanText(name);
+}
+
 // Runs in the selector hook before the original selector reads the score. The game's own rating is kept when it is not
-// zero; a zero is filled only for NVIDIA with both NVAPI values (patch/gpu_score.h). The decision is logged once a run.
+// zero; a zero is filled for NVIDIA with both NVAPI values and for AMD with both AMD values (patch/gpu_score.h). The
+// decision is logged once a run.
 void FillGpuScore() {
   const std::uintptr_t base = g_gameBase.load(std::memory_order_relaxed);
   const MemoryReader& reader = *g_reader.load(std::memory_order_acquire);
@@ -262,8 +483,10 @@ void FillGpuScore() {
     decision.reason = "game_unreadable";
   } else {
     nevr_gpu_score::NvidiaMeasure nvidia;
+    nevr_gpu_score::AmdMeasure amd;
     if (gameScore == 0.0 && vendor == nevr_gpu_score::kVendorNvidia) g_nvidiaQuery(&nvidia);
-    decision = nevr_gpu_score::DecideScore(vendor, gameScore, nvidia);
+    if (gameScore == 0.0 && vendor == nevr_gpu_score::kVendorAmd) g_amdQuery(ReadGameGpuName(reader, base), &amd);
+    decision = nevr_gpu_score::DecideScore(vendor, gameScore, nvidia, amd);
     if (decision.outcome == nevr_gpu_score::Outcome::Filled &&
         !WriteGameScore(nevr_render_config::Resolve(base, nevr_render_config::kGpuScoreVa), decision.score)) {
       decision = nevr_gpu_score::Decision();
@@ -391,6 +614,9 @@ void SetExternalsForTest(Externals externals) { g_externals = std::move(external
 void SetNvidiaQueryForTest(void (*query)(nevr_gpu_score::NvidiaMeasure* out)) {
   g_nvidiaQuery = query != nullptr ? query : &QueryNvidia;
 }
+void SetAmdQueryForTest(void (*query)(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out)) {
+  g_amdQuery = query != nullptr ? query : &QueryAmd;
+}
 void SetBootReturnForTest(std::uintptr_t address) { g_bootReturn.store(address, std::memory_order_relaxed); }
 std::uintptr_t LastApplyReturnForTest() { return g_lastApplyReturn.load(std::memory_order_relaxed); }
 SettingsObserver::View ObservedForTest() { return g_observer.Snapshot(); }
@@ -416,6 +642,7 @@ void ResetForTest() {
   g_traceLogged.store(false);
   g_scoreLogged.store(false);
   g_nvidiaQuery = &QueryNvidia;
+  g_amdQuery = &QueryAmd;
   g_observer.Reset();
 }
 #endif

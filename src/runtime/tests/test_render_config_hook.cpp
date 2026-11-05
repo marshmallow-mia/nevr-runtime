@@ -480,4 +480,105 @@ TEST_F(RenderConfigHook, AZeroScoreWithNoNvapiStaysZeroAndSaysWhy) {
   }
 }
 
+// ---- (#1419) AMD: a zero rating on vendor 2 is filled from the AMD query, which is asked for the game's GPU name ----
+
+std::string g_amdQueryName;
+
+// 72 CUs at 2250 MHz: AGS's teraFlops 20.736 (patch/gpu_score.h).
+void FakeAmdQuery(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out) {
+  ++g_queryCalls;
+  g_amdQueryName = gpuName;
+  out->haveComputeUnits = true;
+  out->computeUnits = 72;
+  out->haveClockMhz = true;
+  out->clockMhz = 2250;
+}
+
+void FakeAmdNoClock(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out) {
+  ++g_queryCalls;
+  g_amdQueryName = gpuName;
+  out->haveComputeUnits = true;
+  out->computeUnits = 72;
+  out->failure = "host_sclk_card_not_found";
+}
+
+TEST_F(RenderConfigHook, AZeroAmdScoreIsFilledFromTheAmdQueryForTheGamesGpu) {
+  const char gpu[] = "AMD Radeon RX 6800 XT";
+  Put(kGpuNameVa, gpu, sizeof(gpu));
+  PutValue<std::uint32_t>(kGpuVendorVa, 2);
+  PutValue<double>(kGpuScoreVa, 0.0);
+  g_queryCalls = 0;
+  g_amdQueryName.clear();
+  hook::SetNvidiaQueryForTest(&FakeNvidiaQuery);
+  hook::SetAmdQueryForTest(&FakeAmdQuery);
+  ASSERT_TRUE(hook::Install(base_, false));
+  ASSERT_EQ(CallSelector(SelectorEntry(), settings_.data()), kSelectorResult);
+  EXPECT_EQ(g_queryCalls, 1);  // the AMD query only, not NVIDIA's
+  EXPECT_EQ(g_amdQueryName, "AMD Radeon RX 6800 XT");
+  double score = 0.0;
+  std::memcpy(&score, At(kGpuScoreVa), sizeof(score));
+  EXPECT_DOUBLE_EQ(score, static_cast<double>(20.736F));
+  EXPECT_EQ(CountContaining("[NEVR.RENDER] gpu_score filled vendor=2 game_score=0 "), 1);
+  EXPECT_EQ(CountContaining(" source=amd_vulkan_sysfs reason=-"), 1);
+}
+
+TEST_F(RenderConfigHook, ANonZeroAmdScoreIsKeptAndTheAmdQueryIsNotAsked) {
+  PutValue<std::uint32_t>(kGpuVendorVa, 2);
+  PutValue<double>(kGpuScoreVa, 12.5);
+  g_queryCalls = 0;
+  hook::SetAmdQueryForTest(&FakeAmdQuery);
+  ASSERT_TRUE(hook::Install(base_, false));
+  ASSERT_EQ(CallSelector(SelectorEntry(), settings_.data()), kSelectorResult);
+  EXPECT_EQ(g_queryCalls, 0);
+  double score = 0.0;
+  std::memcpy(&score, At(kGpuScoreVa), sizeof(score));
+  EXPECT_DOUBLE_EQ(score, 12.5);
+  EXPECT_EQ(CountContaining("[NEVR.RENDER] gpu_score kept vendor=2 "), 1);
+}
+
+TEST_F(RenderConfigHook, AZeroAmdScoreWithoutAClockStaysZeroAndSaysWhy) {
+  PutValue<std::uint32_t>(kGpuVendorVa, 2);
+  PutValue<double>(kGpuScoreVa, 0.0);
+  g_queryCalls = 0;
+  hook::SetNvidiaQueryForTest(&FakeNvidiaQuery);
+  hook::SetAmdQueryForTest(&FakeAmdNoClock);
+  ASSERT_TRUE(hook::Install(base_, false));
+  ASSERT_EQ(CallSelector(SelectorEntry(), settings_.data()), kSelectorResult);
+  EXPECT_EQ(g_queryCalls, 1);
+  double score = 1.0;
+  std::memcpy(&score, At(kGpuScoreVa), sizeof(score));
+  EXPECT_DOUBLE_EQ(score, 0.0);
+  EXPECT_EQ(CountContaining(
+                "[NEVR.RENDER] gpu_score unrated vendor=2 game_score=0 score=0 source=none reason=host_sclk_card_not_found"),
+            1);
+}
+
+TEST_F(RenderConfigHook, AnAmdGpuThatDxgiDoesNotNameStaysUnratedWithTheReason) {
+  // The production AMD query: this test process has no dxgi.dll loaded, so the adapter lookup is the step that fails.
+  PutValue<std::uint32_t>(kGpuVendorVa, 2);
+  PutValue<double>(kGpuScoreVa, 0.0);
+  hook::SetAmdQueryForTest(nullptr);
+  ASSERT_TRUE(hook::Install(base_, false));
+  ASSERT_EQ(CallSelector(SelectorEntry(), settings_.data()), kSelectorResult);
+  double score = 1.0;
+  std::memcpy(&score, At(kGpuScoreVa), sizeof(score));
+  EXPECT_DOUBLE_EQ(score, 0.0);
+  EXPECT_EQ(CountContaining("[NEVR.RENDER] gpu_score unrated vendor=2 game_score=0 score=0 source=none "
+                            "reason=dxgi_adapter_not_found"),
+            1);
+}
+
+TEST_F(RenderConfigHook, AZeroNvidiaScoreDoesNotAskTheAmdQuery) {
+  PutValue<double>(kGpuScoreVa, 0.0);
+  g_queryCalls = 0;
+  g_amdQueryName = "not asked";
+  hook::SetNvidiaQueryForTest(&FakeNvidiaAbsent);
+  hook::SetAmdQueryForTest(&FakeAmdQuery);
+  ASSERT_TRUE(hook::Install(base_, false));
+  ASSERT_EQ(CallSelector(SelectorEntry(), settings_.data()), kSelectorResult);
+  EXPECT_EQ(g_queryCalls, 1);
+  EXPECT_EQ(g_amdQueryName, "not asked");
+  EXPECT_EQ(CountContaining("reason=nvapi_absent"), 1);
+}
+
 }  // namespace

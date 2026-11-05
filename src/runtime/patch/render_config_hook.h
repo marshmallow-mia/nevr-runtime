@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #include "runtime/patch/gpu_score.h"
 #include "runtime/patch/render_config.h"
@@ -13,7 +14,8 @@
 //                                                       profile is applied.
 // The Apply detour calls the original first and returns its result unchanged; it copies a few words into mutex-guarded
 // state and never logs, throws or waits on the game's path. The selector detour is an observer too, with one write: when
-// the game's GPU score is zero it fills the score the selector reads before the original runs (#1419, patch/gpu_score.h),
+// the game's GPU score is zero it fills the score the selector reads before the original runs, from NVAPI on NVIDIA and
+// from Vulkan and the Linux host's clock table on AMD (#1419, patch/gpu_score.h),
 // and it logs that decision once a run. Frequency: ApplyRuntimeGfxSettings has two callers in the whole image (the boot
 // code and the menu/JSON settings translator; the callers of 0x140c31870 in the disassembly), so it runs at boot and when a setting
 // changes; the selector has one caller, at boot. Neither is per frame.
@@ -38,6 +40,9 @@ void SetReaderForTest(const nevr_render_config::MemoryReader* reader);
 void SetExternalsForTest(nevr_render_config::Externals externals);
 /// The NVIDIA query the selector hook asks for a score (#1419); nullptr restores the NVAPI query.
 void SetNvidiaQueryForTest(void (*query)(nevr_gpu_score::NvidiaMeasure* out));
+/// The AMD query the selector hook asks for a score, with the game's GPU name (#1419); nullptr restores the Vulkan and
+/// host clock-table query.
+void SetAmdQueryForTest(void (*query)(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out));
 void SetBootReturnForTest(std::uintptr_t address);
 std::uintptr_t LastApplyReturnForTest();
 nevr_render_config::SettingsObserver::View ObservedForTest();
