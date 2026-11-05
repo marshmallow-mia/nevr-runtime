@@ -32,6 +32,43 @@ bool Plausible(double score) { return std::isfinite(score) && score > 0.0 && sco
 
 }  // namespace
 
+std::uint32_t CudaCoresPerSm(int major, int minor) {
+  if (major < 3) return 0;
+  if (major == 3) return 192;
+  if (major == 6 && minor == 0) return 64;
+  if (major == 7) return 64;
+  if (major == 8 && minor == 0) return 64;
+  return 128;
+}
+
+std::uint32_t BaseClockKhzFromMaxMhz(std::uint32_t maxClockMhz) { return maxClockMhz * 620U; }
+
+NvidiaMeasure MeasureNvidia(const NvidiaAnswers& answers) {
+  NvidiaMeasure m;
+  if (answers.nvapiCoresOk && answers.nvapiCores != 0) {
+    m.haveCores = true;
+    m.cores = answers.nvapiCores;
+  } else if (!answers.vulkanSmsOk || answers.vulkanSms == 0) {
+    m.failure = answers.vulkanFailure[0] != '\0' ? answers.vulkanFailure : "vulkan_no_sm_count";
+  } else if (!answers.nvmlOk) {
+    m.failure = answers.nvmlFailure[0] != '\0' ? answers.nvmlFailure : "nvml_unavailable";
+  } else if (CudaCoresPerSm(answers.cudaMajor, answers.cudaMinor) == 0) {
+    m.failure = "nvml_cuda_capability_unknown";
+  } else {
+    m.haveCores = true;
+    m.cores = answers.vulkanSms * CudaCoresPerSm(answers.cudaMajor, answers.cudaMinor);
+    m.coresFromVulkan = true;
+  }
+  if (!m.haveCores) return m;
+  if (!answers.nvmlOk || answers.maxClockMhz == 0) {
+    m.failure = answers.nvmlFailure[0] != '\0' ? answers.nvmlFailure : "nvml_max_clock_unavailable";
+    return m;
+  }
+  m.haveClockKhz = true;
+  m.clockKhz = BaseClockKhzFromMaxMhz(answers.maxClockMhz);
+  return m;
+}
+
 double AmdScore(std::uint32_t computeUnits, std::uint32_t clockMhz) {
   const std::uint64_t opsPerMicrosecond = static_cast<std::uint64_t>(computeUnits) * kAmdOpsPerComputeUnitClock * clockMhz;
   const float teraFlops = static_cast<float>(static_cast<double>(opsPerMicrosecond) / 1e6);
@@ -113,11 +150,11 @@ Decision DecideScore(std::uint32_t vendor, double gameScore, const NvidiaMeasure
     return decision;
   }
   if (!nvidia.haveCores) {
-    decision.reason = nvidia.failure[0] != '\0' ? nvidia.failure : "nvapi_cores_unavailable";
+    decision.reason = nvidia.failure[0] != '\0' ? nvidia.failure : "nvidia_cores_unavailable";
     return decision;
   }
   if (!nvidia.haveClockKhz) {
-    decision.reason = nvidia.failure[0] != '\0' ? nvidia.failure : "nvapi_clock_unavailable";
+    decision.reason = nvidia.failure[0] != '\0' ? nvidia.failure : "nvidia_clock_unavailable";
     return decision;
   }
   const double score = NvidiaScore(nvidia.cores, nvidia.clockKhz);
@@ -127,7 +164,7 @@ Decision DecideScore(std::uint32_t vendor, double gameScore, const NvidiaMeasure
   }
   decision.outcome = Outcome::Filled;
   decision.score = score;
-  decision.source = "nvidia_nvapi";
+  decision.source = nvidia.coresFromVulkan ? "nvidia_vulkan_nvml" : "nvidia_nvapi_nvml";
   return decision;
 }
 

@@ -422,15 +422,18 @@ TEST_F(RenderConfigHook, TheProductionQueriesAnswerInsteadOfFailingTheLine) {
 int g_queryCalls = 0;
 
 // 3584 cores at 1,500,000 kHz: 10.752, the game's own formula (patch/gpu_score.h).
-void FakeNvidiaQuery(nevr_gpu_score::NvidiaMeasure* out) {
+std::string g_queriedName;
+
+void FakeNvidiaQuery(const std::string& gpuName, nevr_gpu_score::NvidiaMeasure* out) {
   ++g_queryCalls;
+  g_queriedName = gpuName;
   out->haveCores = true;
   out->cores = 3584;
   out->haveClockKhz = true;
   out->clockKhz = 1500000;
 }
 
-void FakeNvidiaAbsent(nevr_gpu_score::NvidiaMeasure* out) {
+void FakeNvidiaAbsent(const std::string& /*gpuName*/, nevr_gpu_score::NvidiaMeasure* out) {
   ++g_queryCalls;
   out->failure = "nvapi_absent";
 }
@@ -438,6 +441,7 @@ void FakeNvidiaAbsent(nevr_gpu_score::NvidiaMeasure* out) {
 TEST_F(RenderConfigHook, AZeroNvidiaScoreIsFilledBeforeTheSelectorRunsAndLoggedOnce) {
   PutValue<double>(kGpuScoreVa, 0.0);
   g_queryCalls = 0;
+  g_queriedName.clear();
   hook::SetNvidiaQueryForTest(&FakeNvidiaQuery);
   ASSERT_TRUE(hook::Install(base_, false));
   ASSERT_EQ(CallSelector(SelectorEntry(), settings_.data()), kSelectorResult);
@@ -445,6 +449,7 @@ TEST_F(RenderConfigHook, AZeroNvidiaScoreIsFilledBeforeTheSelectorRunsAndLoggedO
   double score = 0.0;
   std::memcpy(&score, At(kGpuScoreVa), sizeof(score));
   EXPECT_DOUBLE_EQ(score, 10.752);
+  EXPECT_EQ(g_queriedName, "NVIDIA GeForce GTX 970");  // the game's GPU name, which the Vulkan fallback matches by
   EXPECT_EQ(CountContaining("[NEVR.RENDER] gpu_score filled vendor=1 game_score=0 "), 1);
   EXPECT_EQ(CountContaining("reason=-"), 1);
 }

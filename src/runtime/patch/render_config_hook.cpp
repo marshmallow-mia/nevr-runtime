@@ -116,108 +116,115 @@ std::string QueryRuntimeVersion() {
   return clean.empty() ? std::string("unknown") : clean;
 }
 
-// ---- The GPU score, when the game's own rating failed (#1419). The pure rule is patch/gpu_score.h. ----
+// ---- The GPU score, when the game's own rating failed (#1419). The pure rule is patch/gpu_score.h. A Windows run with a
+// working driver keeps the game's own score and never gets here. ----
 
-// NVAPI function IDs, asked of nvapi_QueryInterface. GetGpuCoreCount and GetAllClockFrequencies are the two calls the game
-// makes in its device init (echovr.exe 0x14058f98c..0x14058fa04, the cores and the base-clock query); the others set up
-// the GPU handle the two take.
+// NVAPI function IDs, asked of nvapi_QueryInterface. GetGpuCoreCount is the call the game makes for the cores in its device
+// init (echovr.exe 0x14058f98c..0x14058fa04); the others set up the GPU handle it takes.
 constexpr std::uint32_t kNvApiInitialize = 0x0150E828U;
 constexpr std::uint32_t kNvApiEnumPhysicalGpus = 0xE5AC921FU;
 constexpr std::uint32_t kNvApiGetGpuCoreCount = 0xC7026A87U;
-constexpr std::uint32_t kNvApiGetAllClockFrequencies = 0xDCB616C3U;
 constexpr std::size_t kNvApiMaxPhysicalGpus = 64;
-// NV_GPU_CLOCK_FREQUENCIES_V3, as NVAPI's header lays it out: version, then ClockType, then 32 domains of 8 bytes each
-// (bIsPresent in bit 0 of the first word, the frequency in kHz in the second). 8 + 32 x 8 = 0x108 bytes.
-constexpr std::uint32_t kNvClockFrequenciesV3 = 0x30108U;
-constexpr std::size_t kNvClockFrequenciesBytes = 0x108;
-constexpr std::uint32_t kNvClockTypeCurrent = 0;  // dxvk-nvapi answers only the current clock (BASE is refused)
-constexpr std::size_t kNvDomainOffset = 8;
-constexpr std::size_t kNvDomainBytes = 8;
-constexpr std::size_t kNvDomainProcessor = 7;  // NVAPI_GPU_PUBLIC_CLOCK_PROCESSOR: the shader clock the FLOPS are made from
 
 using NvStatus = std::int32_t;
 using NvQueryInterfaceFn = void* (*)(std::uint32_t id);
 using NvInitializeFn = NvStatus (*)();
 using NvEnumPhysicalGpusFn = NvStatus (*)(void** handles, std::uint32_t* count);
 using NvGetGpuCoreCountFn = NvStatus (*)(void* handle, std::uint32_t* count);
-using NvGetAllClockFrequenciesFn = NvStatus (*)(void* handle, unsigned char* frequencies);
 
-// Asks NVAPI for the first GPU's cores and its current shader clock. Each value that answers sets its `have` flag; the first
-// step that does not answer names itself in `failure`. The first GPU is the one the game's device is on on a one-NVIDIA
-// machine; a machine with two NVIDIA cards is not separated here.
-void QueryNvidia(nevr_gpu_score::NvidiaMeasure* out) {
+// NVAPI's core count of the first GPU. Under Proton dxvk-nvapi refuses it (`nvapi_get_gpu_core_count_failed` on an RTX
+// 2080 Ti); the first GPU is the one the game's device is on on a one-NVIDIA machine.
+void QueryNvapiCores(nevr_gpu_score::NvidiaAnswers* out) {
   HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
   if (nvapi == nullptr) {
-    out->failure = "nvapi_absent";
+    out->nvapiFailure = "nvapi_absent";
     return;
   }
   const auto query = reinterpret_cast<NvQueryInterfaceFn>(
       reinterpret_cast<void*>(GetProcAddress(nvapi, "nvapi_QueryInterface")));
   if (query == nullptr) {
-    out->failure = "nvapi_no_query_interface";
+    out->nvapiFailure = "nvapi_no_query_interface";
     return;
   }
   const auto initialize = reinterpret_cast<NvInitializeFn>(query(kNvApiInitialize));
   const auto enumGpus = reinterpret_cast<NvEnumPhysicalGpusFn>(query(kNvApiEnumPhysicalGpus));
   const auto coreCount = reinterpret_cast<NvGetGpuCoreCountFn>(query(kNvApiGetGpuCoreCount));
-  const auto clocks = reinterpret_cast<NvGetAllClockFrequenciesFn>(query(kNvApiGetAllClockFrequencies));
-  if (initialize == nullptr || enumGpus == nullptr || coreCount == nullptr || clocks == nullptr) {
-    out->failure = "nvapi_function_missing";
+  if (initialize == nullptr || enumGpus == nullptr || coreCount == nullptr) {
+    out->nvapiFailure = "nvapi_function_missing";
     return;
   }
   if (initialize() != 0) {
-    out->failure = "nvapi_initialize_failed";
+    out->nvapiFailure = "nvapi_initialize_failed";
     return;
   }
   void* handles[kNvApiMaxPhysicalGpus] = {};
   std::uint32_t count = 0;
   if (enumGpus(handles, &count) != 0 || count == 0) {
-    out->failure = "nvapi_enum_gpus_failed";
+    out->nvapiFailure = "nvapi_enum_gpus_failed";
     return;
   }
   std::uint32_t cores = 0;
   if (coreCount(handles[0], &cores) != 0 || cores == 0) {
-    out->failure = "nvapi_get_gpu_core_count_failed";
+    out->nvapiFailure = "nvapi_get_gpu_core_count_failed";
     return;
   }
-  out->haveCores = true;
-  out->cores = cores;
-
-  unsigned char frequencies[kNvClockFrequenciesBytes] = {};
-  const std::uint32_t version = kNvClockFrequenciesV3;
-  const std::uint32_t clockType = kNvClockTypeCurrent;
-  std::memcpy(frequencies, &version, sizeof(version));
-  std::memcpy(frequencies + 4, &clockType, sizeof(clockType));
-  if (clocks(handles[0], frequencies) != 0) {
-    out->failure = "nvapi_get_all_clock_frequencies_failed";
-    return;
-  }
-  std::uint32_t present = 0;
-  std::uint32_t khz = 0;
-  const std::size_t domain = kNvDomainOffset + kNvDomainProcessor * kNvDomainBytes;
-  std::memcpy(&present, frequencies + domain, sizeof(present));
-  std::memcpy(&khz, frequencies + domain + 4, sizeof(khz));
-  if ((present & 1U) == 0 || khz == 0) {
-    out->failure = "nvapi_clock_domain_absent";
-    return;
-  }
-  out->haveClockKhz = true;
-  out->clockKhz = khz;
+  out->nvapiCoresOk = true;
+  out->nvapiCores = cores;
 }
 
-using NvidiaQueryFn = void (*)(nevr_gpu_score::NvidiaMeasure* out);
+// NVML (under Proton, Wine's nvml.dll bridges to the host driver): the first device's CUDA compute capability and its
+// maximum graphics clock.
+using NvmlInitFn = int (*)();
+using NvmlShutdownFn = int (*)();
+using NvmlGetHandleByIndexFn = int (*)(unsigned index, void** device);
+using NvmlGetCudaComputeCapabilityFn = int (*)(void* device, int* major, int* minor);
+using NvmlGetMaxClockInfoFn = int (*)(void* device, int clockType, unsigned* mhz);
+constexpr int kNvmlClockGraphics = 0;
 
-// ---- AMD. The game's AGS teraFlops is 0 under Proton; the same figure is made from Vulkan's compute-unit count and the
-// Linux host's top engine clock (patch/gpu_score.h, AmdScore). A Windows run with a working AMD driver keeps the game's
-// own score and never gets here. ----
+void QueryNvml(nevr_gpu_score::NvidiaAnswers* out) {
+  HMODULE nvml = LoadLibraryW(L"nvml.dll");
+  if (nvml == nullptr) {
+    out->nvmlFailure = "nvml_absent";
+    return;
+  }
+  const auto init = reinterpret_cast<NvmlInitFn>(reinterpret_cast<void*>(GetProcAddress(nvml, "nvmlInit_v2")));
+  const auto shutdown = reinterpret_cast<NvmlShutdownFn>(reinterpret_cast<void*>(GetProcAddress(nvml, "nvmlShutdown")));
+  const auto handle = reinterpret_cast<NvmlGetHandleByIndexFn>(
+      reinterpret_cast<void*>(GetProcAddress(nvml, "nvmlDeviceGetHandleByIndex_v2")));
+  const auto capability = reinterpret_cast<NvmlGetCudaComputeCapabilityFn>(
+      reinterpret_cast<void*>(GetProcAddress(nvml, "nvmlDeviceGetCudaComputeCapability")));
+  const auto maxClock = reinterpret_cast<NvmlGetMaxClockInfoFn>(
+      reinterpret_cast<void*>(GetProcAddress(nvml, "nvmlDeviceGetMaxClockInfo")));
+  if (init == nullptr || handle == nullptr || capability == nullptr || maxClock == nullptr) {
+    out->nvmlFailure = "nvml_function_missing";
+  } else if (init() != 0) {
+    out->nvmlFailure = "nvml_init_failed";
+  } else {
+    void* device = nullptr;
+    unsigned mhz = 0;
+    if (handle(0, &device) != 0 || device == nullptr) {
+      out->nvmlFailure = "nvml_no_device";
+    } else if (capability(device, &out->cudaMajor, &out->cudaMinor) != 0) {
+      out->nvmlFailure = "nvml_cuda_capability_failed";
+    } else if (maxClock(device, kNvmlClockGraphics, &mhz) != 0 || mhz == 0) {
+      out->nvmlFailure = "nvml_max_clock_failed";
+    } else {
+      out->nvmlOk = true;
+      out->maxClockMhz = mhz;
+    }
+    if (shutdown != nullptr) shutdown();
+  }
+  FreeLibrary(nvml);
+}
 
 // The Linux host's DRM class directory, through the Z: drive Wine maps to the host's root. It exists only under Wine.
 constexpr const char* kHostDrmRoot = "Z:\\sys\\class\\drm";
 
-// The Vulkan structures the AMD query reads, as the Vulkan 1.1 headers lay them out (the tree has no Vulkan headers).
+// The Vulkan structures the queries read, as the Vulkan 1.1 headers lay them out (the tree has no Vulkan headers).
 constexpr std::int32_t kVkStructureTypeApplicationInfo = 0;
 constexpr std::int32_t kVkStructureTypeInstanceCreateInfo = 1;
 constexpr std::int32_t kVkStructureTypePhysicalDeviceProperties2 = 1000059001;
+constexpr std::int32_t kVkStructureTypeShaderSmBuiltinsPropertiesNv = 1000154001;
 constexpr std::int32_t kVkStructureTypeShaderCorePropertiesAmd = 1000185000;
 constexpr std::int32_t kVkStructureTypeShaderCoreProperties2Amd = 1000227000;
 constexpr std::uint32_t kVkApiVersion11 = (1U << 22) | (1U << 12);
@@ -253,6 +260,12 @@ struct VkPhysicalDeviceProperties2Lite {
   unsigned char rest[824 - 16];
 };
 static_assert(sizeof(VkPhysicalDeviceProperties2Lite) == 840, "VkPhysicalDeviceProperties2 is 840 bytes on x64");
+struct VkShaderSmBuiltinsPropertiesNvLite {
+  std::int32_t sType;
+  void* pNext;
+  std::uint32_t shaderSMCount;
+  std::uint32_t shaderWarpsPerSM;
+};
 // VkPhysicalDeviceShaderCorePropertiesAMD: 14 uint32 after the header; the first three are the CU layout.
 struct VkShaderCorePropertiesAmdLite {
   std::int32_t sType;
@@ -281,8 +294,8 @@ using VkGetPhysicalDeviceProperties2Fn = void (*)(void* device, VkPhysicalDevice
 using VkEnumerateDeviceExtensionPropertiesFn = std::int32_t (*)(void* device, const char* layer, std::uint32_t* count,
                                                                 VkExtensionPropertiesLite* properties);
 
-// The PCI vendor and device id of the DXGI adapter whose description is the game's GPU name: the adapter the game matched
-// its AGS device by (0x14058eb90..0x14058ebb2).
+// The PCI vendor and device id of the DXGI adapter whose description is the game's GPU name: the adapter the game rated
+// (it matches its AGS device by this name, 0x14058eb90..0x14058ebb2).
 bool AdapterIdsByName(const std::string& gpuName, std::uint32_t* vendorId, std::uint32_t* deviceId) {
   HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
   if (dxgi == nullptr) return false;
@@ -312,12 +325,21 @@ bool AdapterIdsByName(const std::string& gpuName, std::uint32_t* vendorId, std::
   return found;
 }
 
-// The compute units of the Vulkan device with this PCI vendor and device id; the step that failed in `out->failure`.
-void QueryVulkanComputeUnits(std::uint32_t vendorId, std::uint32_t deviceId, nevr_gpu_score::AmdMeasure* out) {
+// What Vulkan says of one device: NVIDIA's SM count (VK_NV_shader_sm_builtins) and AMD's compute units.
+struct VulkanCores {
+  bool found = false;
+  std::uint32_t nvidiaSms = 0;
+  std::uint32_t amdComputeUnits = 0;
+  const char* failure = "";
+};
+
+// The core properties of the Vulkan device with this PCI vendor and device id; the step that failed in `failure`.
+VulkanCores QueryVulkanCores(std::uint32_t vendorId, std::uint32_t deviceId) {
+  VulkanCores out;
   HMODULE vulkan = LoadLibraryW(L"vulkan-1.dll");
   if (vulkan == nullptr) {
-    out->failure = "vulkan_absent";
-    return;
+    out.failure = "vulkan_absent";
+    return out;
   }
   const auto getProc = reinterpret_cast<VkGetInstanceProcAddrFn>(
       reinterpret_cast<void*>(GetProcAddress(vulkan, "vkGetInstanceProcAddr")));
@@ -325,14 +347,14 @@ void QueryVulkanComputeUnits(std::uint32_t vendorId, std::uint32_t deviceId, nev
       getProc != nullptr ? reinterpret_cast<VkCreateInstanceFn>(getProc(nullptr, "vkCreateInstance")) : nullptr;
   void* instance = nullptr;
   if (createInstance == nullptr) {
-    out->failure = "vulkan_no_create_instance";
+    out.failure = "vulkan_no_create_instance";
   } else {
     const VkApplicationInfoLite app = {kVkStructureTypeApplicationInfo, nullptr, "nevr-runtime", 1, "nevr-runtime", 1,
                                        kVkApiVersion11};
     const VkInstanceCreateInfoLite info = {kVkStructureTypeInstanceCreateInfo, nullptr, 0, &app, 0, nullptr, 0, nullptr};
     if (createInstance(&info, nullptr, &instance) != 0 || instance == nullptr) {
       instance = nullptr;
-      out->failure = "vulkan_create_instance_failed";
+      out.failure = "vulkan_create_instance_failed";
     }
   }
   if (instance != nullptr) {
@@ -345,11 +367,11 @@ void QueryVulkanComputeUnits(std::uint32_t vendorId, std::uint32_t deviceId, nev
     void* devices[kVkMaxPhysicalDevices] = {};
     std::uint32_t count = kVkMaxPhysicalDevices;
     if (enumerate == nullptr || properties2 == nullptr || extensions == nullptr) {
-      out->failure = "vulkan_function_missing";
+      out.failure = "vulkan_function_missing";
     } else if (enumerate(instance, &count, devices) < 0) {
-      out->failure = "vulkan_enumerate_failed";
+      out.failure = "vulkan_enumerate_failed";
     } else {
-      out->failure = "vulkan_no_matching_device";
+      out.failure = "vulkan_no_matching_device";
       for (std::uint32_t i = 0; i < count && i < kVkMaxPhysicalDevices; ++i) {
         VkPhysicalDeviceProperties2Lite props = {};
         props.sType = kVkStructureTypePhysicalDeviceProperties2;
@@ -366,11 +388,17 @@ void QueryVulkanComputeUnits(std::uint32_t vendorId, std::uint32_t deviceId, nev
           }
           return false;
         };
+        VkShaderSmBuiltinsPropertiesNvLite sm = {};
+        sm.sType = kVkStructureTypeShaderSmBuiltinsPropertiesNv;
         VkShaderCorePropertiesAmdLite core = {};
         core.sType = kVkStructureTypeShaderCorePropertiesAmd;
         VkShaderCoreProperties2AmdLite core2 = {};
         core2.sType = kVkStructureTypeShaderCoreProperties2Amd;
         void* chain = nullptr;
+        if (has("VK_NV_shader_sm_builtins")) {
+          sm.pNext = chain;
+          chain = &sm;
+        }
         if (has("VK_AMD_shader_core_properties")) {
           core.pNext = chain;
           chain = &core;
@@ -381,26 +409,46 @@ void QueryVulkanComputeUnits(std::uint32_t vendorId, std::uint32_t deviceId, nev
         }
         props.pNext = chain;
         properties2(devices[i], &props);
-        const std::uint32_t units =
+        out.found = true;
+        out.failure = "";
+        out.nvidiaSms = sm.shaderSMCount;
+        out.amdComputeUnits =
             nevr_gpu_score::AmdComputeUnits(core2.activeComputeUnitCount, core.shaderEngineCount,
                                             core.shaderArraysPerEngineCount, core.computeUnitsPerShaderArray);
-        if (units == 0) {
-          out->failure = "vulkan_no_shader_core_properties";
-        } else {
-          out->haveComputeUnits = true;
-          out->computeUnits = units;
-          out->failure = "";
-        }
         break;
       }
     }
     if (destroy != nullptr) destroy(instance, nullptr);
   }
   FreeLibrary(vulkan);
+  return out;
 }
 
-// Asks for the compute units and the top engine clock of the GPU named `gpuName`. Each value that answers sets its `have`
-// flag; the first step that does not answer names itself in `failure`.
+// NVIDIA: NVAPI's cores, else Vulkan's SMs for the game's adapter x NVML's cores per SM; the clock from NVML
+// (patch/gpu_score.h, MeasureNvidia).
+void QueryNvidia(const std::string& gpuName, nevr_gpu_score::NvidiaMeasure* out) {
+  nevr_gpu_score::NvidiaAnswers answers;
+  QueryNvapiCores(&answers);
+  if (!answers.nvapiCoresOk) {
+    std::uint32_t vendorId = 0;
+    std::uint32_t deviceId = 0;
+    if (!AdapterIdsByName(gpuName, &vendorId, &deviceId)) {
+      answers.vulkanFailure = "dxgi_adapter_not_found";
+    } else {
+      const VulkanCores vulkan = QueryVulkanCores(vendorId, deviceId);
+      answers.vulkanSmsOk = vulkan.found && vulkan.nvidiaSms != 0;
+      answers.vulkanSms = vulkan.nvidiaSms;
+      answers.vulkanFailure = vulkan.found && vulkan.nvidiaSms == 0 ? "vulkan_no_sm_builtins" : vulkan.failure;
+    }
+  }
+  QueryNvml(&answers);
+  *out = nevr_gpu_score::MeasureNvidia(answers);
+}
+
+using NvidiaQueryFn = void (*)(const std::string& gpuName, nevr_gpu_score::NvidiaMeasure* out);
+
+// AMD: compute units from Vulkan and the Linux host's top engine clock (patch/gpu_score.h, AmdScore). Each value that
+// answers sets its `have` flag; the first step that does not answer names itself in `failure`.
 void QueryAmd(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out) {
   std::uint32_t vendorId = 0;
   std::uint32_t deviceId = 0;
@@ -408,8 +456,17 @@ void QueryAmd(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out) {
     out->failure = "dxgi_adapter_not_found";
     return;
   }
-  QueryVulkanComputeUnits(vendorId, deviceId, out);
-  if (!out->haveComputeUnits) return;
+  const VulkanCores vulkan = QueryVulkanCores(vendorId, deviceId);
+  if (!vulkan.found) {
+    out->failure = vulkan.failure;
+    return;
+  }
+  if (vulkan.amdComputeUnits == 0) {
+    out->failure = "vulkan_no_shader_core_properties";
+    return;
+  }
+  out->haveComputeUnits = true;
+  out->computeUnits = vulkan.amdComputeUnits;
   nevr_gpu_score::ReadHostSclk(kHostDrmRoot, deviceId, out);
 }
 
@@ -484,7 +541,7 @@ void FillGpuScore() {
   } else {
     nevr_gpu_score::NvidiaMeasure nvidia;
     nevr_gpu_score::AmdMeasure amd;
-    if (gameScore == 0.0 && vendor == nevr_gpu_score::kVendorNvidia) g_nvidiaQuery(&nvidia);
+    if (gameScore == 0.0 && vendor == nevr_gpu_score::kVendorNvidia) g_nvidiaQuery(ReadGameGpuName(reader, base), &nvidia);
     if (gameScore == 0.0 && vendor == nevr_gpu_score::kVendorAmd) g_amdQuery(ReadGameGpuName(reader, base), &amd);
     decision = nevr_gpu_score::DecideScore(vendor, gameScore, nvidia, amd);
     if (decision.outcome == nevr_gpu_score::Outcome::Filled &&
@@ -611,7 +668,7 @@ void SetReaderForTest(const MemoryReader* reader) {
   g_reader.store(reader != nullptr ? reader : &g_processReader, std::memory_order_release);
 }
 void SetExternalsForTest(Externals externals) { g_externals = std::move(externals); }
-void SetNvidiaQueryForTest(void (*query)(nevr_gpu_score::NvidiaMeasure* out)) {
+void SetNvidiaQueryForTest(void (*query)(const std::string& gpuName, nevr_gpu_score::NvidiaMeasure* out)) {
   g_nvidiaQuery = query != nullptr ? query : &QueryNvidia;
 }
 void SetAmdQueryForTest(void (*query)(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out)) {

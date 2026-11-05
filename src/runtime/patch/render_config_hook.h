@@ -14,7 +14,7 @@
 //                                                       profile is applied.
 // The Apply detour calls the original first and returns its result unchanged; it copies a few words into mutex-guarded
 // state and never logs, throws or waits on the game's path. The selector detour is an observer too, with one write: when
-// the game's GPU score is zero it fills the score the selector reads before the original runs, from NVAPI on NVIDIA and
+// the game's GPU score is zero it fills the score the selector reads before the original runs, from NVAPI, Vulkan and NVML on NVIDIA and
 // from Vulkan and the Linux host's clock table on AMD (#1419, patch/gpu_score.h),
 // and it logs that decision once a run. Frequency: ApplyRuntimeGfxSettings has two callers in the whole image (the boot
 // code and the menu/JSON settings translator; the callers of 0x140c31870 in the disassembly), so it runs at boot and when a setting
@@ -38,8 +38,9 @@ void Poll(std::uint64_t nowUs);
 /// with, the last return address the Apply hook saw, and a full reset (hooks off, state cleared).
 void SetReaderForTest(const nevr_render_config::MemoryReader* reader);
 void SetExternalsForTest(nevr_render_config::Externals externals);
-/// The NVIDIA query the selector hook asks for a score (#1419); nullptr restores the NVAPI query.
-void SetNvidiaQueryForTest(void (*query)(nevr_gpu_score::NvidiaMeasure* out));
+/// The NVIDIA query the selector hook asks for a score, with the game's GPU name (#1419); nullptr restores the NVAPI,
+/// Vulkan and NVML query.
+void SetNvidiaQueryForTest(void (*query)(const std::string& gpuName, nevr_gpu_score::NvidiaMeasure* out));
 /// The AMD query the selector hook asks for a score, with the game's GPU name (#1419); nullptr restores the Vulkan and
 /// host clock-table query.
 void SetAmdQueryForTest(void (*query)(const std::string& gpuName, nevr_gpu_score::AmdMeasure* out));

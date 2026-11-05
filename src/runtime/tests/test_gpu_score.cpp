@@ -67,7 +67,7 @@ TEST(GpuScore, ANvidiaZeroScoreWithBothValuesIsFilledWithTheFormula) {
   const auto d = DecideScore(nevr_gpu_score::kVendorNvidia, 0.0, Measured(3584, 1500000));
   EXPECT_EQ(d.outcome, Outcome::Filled);
   EXPECT_DOUBLE_EQ(d.score, 10.752);
-  EXPECT_STREQ(d.source, "nvidia_nvapi");
+  EXPECT_STREQ(d.source, "nvidia_nvapi_nvml");
   EXPECT_STREQ(d.reason, "");
 }
 
@@ -93,7 +93,7 @@ TEST(GpuScore, AMissingNvapiValueNamesTheStepThatFailed) {
   noClock.cores = 3584;
   const auto b = DecideScore(nevr_gpu_score::kVendorNvidia, 0.0, noClock);
   EXPECT_EQ(b.outcome, Outcome::Unrated);
-  EXPECT_STREQ(b.reason, "nvapi_clock_unavailable");
+  EXPECT_STREQ(b.reason, "nvidia_clock_unavailable");
 }
 
 TEST(GpuScore, AZeroOrAbsurdNvidiaResultStaysUnrated) {
@@ -112,6 +112,124 @@ TEST(GpuScore, ANanGameScoreIsKeptAsItIs) {
   const auto d = DecideScore(nevr_gpu_score::kVendorNvidia, nan, Measured(3584, 1500000));
   EXPECT_EQ(d.outcome, Outcome::Kept);
   EXPECT_TRUE(std::isnan(d.score));
+}
+
+// ---- NVIDIA fallbacks: NVAPI's cores, else Vulkan's SMs x NVML's cores per SM; NVML's max clock x 0.62 ----
+
+using nevr_gpu_score::NvidiaAnswers;
+
+// The CUDA cores per SM of each compute capability (NVIDIA's CUDA C Programming Guide, "Arithmetic Instructions": the
+// 32-bit floating-point add, multiply, multiply-add throughput per SM per clock).
+TEST(GpuScoreNvidia, CoresPerSmFollowTheComputeCapability) {
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(2, 1), 0U);   // Fermi: not rated
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(3, 5), 192U);  // Kepler
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(5, 2), 128U);  // Maxwell (GTX 970)
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(6, 0), 64U);   // GP100
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(6, 1), 128U);  // Pascal (GTX 1080)
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(7, 0), 64U);   // Volta
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(7, 5), 64U);   // Turing (RTX 2080 Ti)
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(8, 0), 64U);   // GA100
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(8, 6), 128U);  // Ampere (RTX 3080)
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(8, 9), 128U);  // Ada (RTX 4090)
+  EXPECT_EQ(nevr_gpu_score::CudaCoresPerSm(12, 0), 128U);  // Blackwell (RTX 5090)
+}
+
+TEST(GpuScoreNvidia, TheBaseClockIsSixtyTwoPercentOfTheMaxClockInKhz) {
+  EXPECT_EQ(nevr_gpu_score::BaseClockKhzFromMaxMhz(2190), 1357800U);
+  EXPECT_EQ(nevr_gpu_score::BaseClockKhzFromMaxMhz(0), 0U);
+}
+
+NvidiaAnswers Rtx2080TiUnderProton() {
+  NvidiaAnswers a;
+  a.nvapiFailure = "nvapi_get_gpu_core_count_failed";
+  a.vulkanSmsOk = true;
+  a.vulkanSms = 68;
+  a.nvmlOk = true;
+  a.cudaMajor = 7;
+  a.cudaMinor = 5;
+  a.maxClockMhz = 2190;
+  return a;
+}
+
+// The measured case: an RTX 2080 Ti under Proton, where dxvk-nvapi refuses the core count. 68 SMs x 64 = 4352 cores,
+// 2190 MHz x 0.62 = 1357.8 MHz: 4352 x 1357800 x 2 x 1e-9 = 11.8182912, over the selector's 8.0 for High.
+TEST(GpuScoreNvidia, AnRtx2080TiUnderProtonIsFilledFromVulkanAndNvml) {
+  const NvidiaMeasure m = nevr_gpu_score::MeasureNvidia(Rtx2080TiUnderProton());
+  EXPECT_TRUE(m.haveCores);
+  EXPECT_EQ(m.cores, 4352U);
+  EXPECT_TRUE(m.coresFromVulkan);
+  EXPECT_TRUE(m.haveClockKhz);
+  EXPECT_EQ(m.clockKhz, 1357800U);
+  const auto d = DecideScore(nevr_gpu_score::kVendorNvidia, 0.0, m);
+  EXPECT_EQ(d.outcome, Outcome::Filled);
+  EXPECT_NEAR(d.score, 11.8182912, 1e-9);
+  EXPECT_GE(d.score, 8.0);
+  EXPECT_STREQ(d.source, "nvidia_vulkan_nvml");
+}
+
+TEST(GpuScoreNvidia, NvapiCoresComeFirstAndVulkanIsNotUsed) {
+  NvidiaAnswers a = Rtx2080TiUnderProton();
+  a.nvapiCoresOk = true;
+  a.nvapiCores = 4352;
+  a.vulkanSms = 1;  // ignored
+  const NvidiaMeasure m = nevr_gpu_score::MeasureNvidia(a);
+  EXPECT_EQ(m.cores, 4352U);
+  EXPECT_FALSE(m.coresFromVulkan);
+  const auto d = DecideScore(nevr_gpu_score::kVendorNvidia, 0.0, m);
+  EXPECT_STREQ(d.source, "nvidia_nvapi_nvml");
+}
+
+TEST(GpuScoreNvidia, AZeroNvapiCountFallsBackToVulkan) {
+  NvidiaAnswers a = Rtx2080TiUnderProton();
+  a.nvapiCoresOk = true;
+  a.nvapiCores = 0;
+  EXPECT_TRUE(nevr_gpu_score::MeasureNvidia(a).coresFromVulkan);
+}
+
+TEST(GpuScoreNvidia, EachMissingAnswerNamesItself) {
+  NvidiaAnswers noVulkan = Rtx2080TiUnderProton();
+  noVulkan.vulkanSmsOk = false;
+  noVulkan.vulkanFailure = "vulkan_absent";
+  EXPECT_FALSE(nevr_gpu_score::MeasureNvidia(noVulkan).haveCores);
+  EXPECT_STREQ(DecideScore(1, 0.0, nevr_gpu_score::MeasureNvidia(noVulkan)).reason, "vulkan_absent");
+
+  NvidiaAnswers noVulkanReason = noVulkan;
+  noVulkanReason.vulkanFailure = "";
+  EXPECT_STREQ(nevr_gpu_score::MeasureNvidia(noVulkanReason).failure, "vulkan_no_sm_count");
+
+  NvidiaAnswers noNvml = Rtx2080TiUnderProton();
+  noNvml.nvmlOk = false;
+  noNvml.nvmlFailure = "nvml_absent";
+  const NvidiaMeasure m = nevr_gpu_score::MeasureNvidia(noNvml);
+  EXPECT_FALSE(m.haveCores);
+  EXPECT_FALSE(m.haveClockKhz);
+  EXPECT_STREQ(DecideScore(1, 0.0, m).reason, "nvml_absent");
+
+  NvidiaAnswers noNvmlReason = noNvml;
+  noNvmlReason.nvmlFailure = "";
+  EXPECT_STREQ(nevr_gpu_score::MeasureNvidia(noNvmlReason).failure, "nvml_unavailable");
+
+  NvidiaAnswers oldGpu = Rtx2080TiUnderProton();
+  oldGpu.cudaMajor = 2;
+  EXPECT_STREQ(nevr_gpu_score::MeasureNvidia(oldGpu).failure, "nvml_cuda_capability_unknown");
+
+  NvidiaAnswers noClock = Rtx2080TiUnderProton();
+  noClock.maxClockMhz = 0;
+  const NvidiaMeasure c = nevr_gpu_score::MeasureNvidia(noClock);
+  EXPECT_TRUE(c.haveCores);
+  EXPECT_FALSE(c.haveClockKhz);
+  EXPECT_STREQ(DecideScore(1, 0.0, c).reason, "nvml_max_clock_unavailable");
+}
+
+TEST(GpuScoreNvidia, NvapiCoresWithoutNvmlStillLackTheClock) {
+  NvidiaAnswers a;
+  a.nvapiCoresOk = true;
+  a.nvapiCores = 3584;
+  a.nvmlFailure = "nvml_absent";
+  const NvidiaMeasure m = nevr_gpu_score::MeasureNvidia(a);
+  EXPECT_TRUE(m.haveCores);
+  EXPECT_FALSE(m.haveClockKhz);
+  EXPECT_STREQ(DecideScore(1, 0.0, m).reason, "nvml_absent");
 }
 
 // ---- AMD (vendor 2): AGS's teraFlops, which the game widens from a float (cvtps2pd at 0x14058ec7a) ----
@@ -149,7 +267,7 @@ TEST(GpuScore, ANonZeroAmdGameScoreIsKeptAndTheMeasureIgnored) {
 TEST(GpuScore, AnAmdMeasureDoesNotRateNvidiaNorTheReverse) {
   const auto nvidia = DecideScore(nevr_gpu_score::kVendorNvidia, 0.0, NvidiaMeasure(), AmdMeasured(72, 2250));
   EXPECT_EQ(nvidia.outcome, Outcome::Unrated);
-  EXPECT_STREQ(nvidia.reason, "nvapi_cores_unavailable");
+  EXPECT_STREQ(nvidia.reason, "nvidia_cores_unavailable");
   const auto amd = DecideScore(nevr_gpu_score::kVendorAmd, 0.0, Measured(3584, 1500000), AmdMeasure());
   EXPECT_EQ(amd.outcome, Outcome::Unrated);
   EXPECT_STREQ(amd.reason, "amd_compute_units_unavailable");

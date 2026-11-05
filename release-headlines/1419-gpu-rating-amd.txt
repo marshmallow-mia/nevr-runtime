@@ -1,1 +1,1 @@
-On Linux with an AMD card under Proton, a first start now picks graphics settings from the GPU instead of always the lowest preset.
+On Linux under Proton, a first start now picks graphics settings from the GPU, NVIDIA or AMD, instead of always the lowest preset.

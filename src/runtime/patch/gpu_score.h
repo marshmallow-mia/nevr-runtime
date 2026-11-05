@@ -26,10 +26,43 @@ inline constexpr double kMaxPlausibleScore = 1000.0;
 struct NvidiaMeasure {
   bool haveCores = false;
   std::uint32_t cores = 0;
+  bool coresFromVulkan = false;  // false: NVAPI's GetGpuCoreCount; true: Vulkan SMs x NVML's cores per SM
   bool haveClockKhz = false;
   std::uint32_t clockKhz = 0;
   const char* failure = "";
 };
+
+/// The raw answers of the NVIDIA sources, before the choice. Under Proton dxvk-nvapi refuses GetGpuCoreCount (a live run
+/// on an RTX 2080 Ti: `reason=nvapi_get_gpu_core_count_failed`), so the cores come from Vulkan
+/// (VK_NV_shader_sm_builtins' shaderSMCount) times the FP32 cores per SM of NVML's CUDA compute capability. The clock is
+/// NVML's maximum graphics clock x 0.62: NVAPI's base clock is refused under Proton, and its current clock is not used,
+/// because it is whatever the GPU idles or boosts at when the game asks (300 to 1995 MHz on that card during start-up).
+struct NvidiaAnswers {
+  bool nvapiCoresOk = false;
+  std::uint32_t nvapiCores = 0;
+  const char* nvapiFailure = "";
+  bool vulkanSmsOk = false;
+  std::uint32_t vulkanSms = 0;
+  const char* vulkanFailure = "";
+  bool nvmlOk = false;
+  int cudaMajor = 0;
+  int cudaMinor = 0;
+  std::uint32_t maxClockMhz = 0;
+  const char* nvmlFailure = "";
+};
+
+/// The FP32 cores per SM of a CUDA compute capability (the CUDA C++ Programming Guide's throughput table): 192 for Kepler
+/// (3.x), 128 for Maxwell (5.x), 64 for GP100 (6.0), 128 for the other Pascal parts (6.1, 6.2), 64 for Volta and Turing
+/// (7.x), 64 for GA100 (8.0), 128 for every later part (8.6 on, Hopper, Blackwell). 0 for a capability below 3.0.
+std::uint32_t CudaCoresPerSm(int major, int minor);
+
+/// The base clock the game's formula takes, in kHz, from NVML's maximum graphics clock: max MHz x 0.62 (an RTX 2080 Ti:
+/// 2190 MHz -> 1357.8 MHz, against its rated 1350 MHz base), in whole kHz as the game multiplies it.
+std::uint32_t BaseClockKhzFromMaxMhz(std::uint32_t maxClockMhz);
+
+/// The measure the decision reads: NVAPI's cores when it answered, else Vulkan's SMs x CudaCoresPerSm; the clock from
+/// NVML. The failure is the step that left a value missing.
+NvidiaMeasure MeasureNvidia(const NvidiaAnswers& answers);
 
 /// What the AMD query found: compute units from Vulkan, the top engine clock from the host's amdgpu clock table. `failure`
 /// names the first step that did not answer, "" when none failed.
@@ -46,7 +79,8 @@ enum class Outcome { Kept, Filled, Unrated };
 struct Decision {
   Outcome outcome = Outcome::Unrated;
   double score = 0.0;               // the score the selector should see
-  const char* source = "none";      // "game" (kept), "nvidia_nvapi" or "amd_vulkan_sysfs" (filled), "none" (unrated)
+  const char* source = "none";      // "game" (kept); "nvidia_nvapi_nvml", "nvidia_vulkan_nvml" or "amd_vulkan_sysfs"
+                                    // (filled); "none" (unrated)
   const char* reason = "";          // why unrated; "" otherwise
 };
 
@@ -74,7 +108,7 @@ std::uint32_t TopSclkMhz(std::string_view ppDpmSclk);
 void ReadHostSclk(const std::string& drmRoot, std::uint32_t deviceId, AmdMeasure* out);
 
 /// The score the selector should see. A non-zero game score is kept as it is, whatever the vendor (Windows is untouched).
-/// A zero score is filled for NVIDIA with both NVAPI values and for AMD with both AMD values, each with its own vendor's
+/// A zero score is filled for NVIDIA with both NVIDIA values and for AMD with both AMD values, each with its own vendor's
 /// formula, and only when the result is a finite, positive, plausible number; otherwise it stays zero and the reason says
 /// which step failed.
 Decision DecideScore(std::uint32_t vendor, double gameScore, const NvidiaMeasure& nvidia,
